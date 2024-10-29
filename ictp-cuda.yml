@@ -1,0 +1,25 @@
+name: ictp-cuda
+channels:
+  - pytorch
+  - nvidia
+  - defaults
+dependencies:
+    - python=3.11
+    - pip>=2.3
+    - pytorch
+    - torchvision
+    - torchaudio
+    - pytorch-cuda=12.1
+    - jupyter
+    - scikit-learn
+    - scipy
+    - matplotlib
+    - pyyaml
+    - ipykernel
+    - pip:
+        - opt-einsum-fx
+        - torch-ema
+        - dill
+        - matscipy
+        - fire
+        - ase==3.22.1
