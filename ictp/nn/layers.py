@@ -11,7 +11,7 @@
             Nicolas Weber (nicolas.weber@neclab.eu)
             Mathias Niepert (mathias.niepert@ki.uni-stuttgart.de)
 
-NEC Laboratories Europe GmbH, Copyright (c) 2024, All rights reserved.  
+NEC Laboratories Europe GmbH, Copyright (c) 2025, All rights reserved.  
 
        THIS HEADER MAY NOT BE EXTRACTED OR MODIFIED IN ANY WAY.
  
@@ -168,10 +168,10 @@ from ictp.utils.math import segment_sum
 
 
 class RescaledSiLULayer(nn.Module):
-    """Rescaled SiLU layer.
-    """
+    """Rescaled SiLU layer."""
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Applies rescaled SiLU to the input tensor.
+        """
+        Applies rescaled SiLU to the input tensor.
 
         Args:
             x (torch.Tensor): Input tensor.
@@ -183,17 +183,20 @@ class RescaledSiLULayer(nn.Module):
 
 
 class LinearLayer(nn.Module):
-    """Simple linear layer.
+    """
+    Simple linear layer.
 
     Args:
         in_features (int): Number of input features.
         out_features (int): Number of output features.
         bias (bool, optional): If True, apply bias. Defaults to False.
     """
-    def __init__(self, 
-                 in_features: int,
-                 out_features: int,
-                 bias: bool = False):
+    def __init__(
+        self, 
+        in_features: int,
+        out_features: int,
+        bias: bool = False
+    ):
         super(LinearLayer, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -206,7 +209,8 @@ class LinearLayer(nn.Module):
             self.register_buffer('bias', None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Applies linear layer to the input tensor.
+        """
+        Applies linear layer to the input tensor.
 
         Args:
             x (torch.Tensor): Input tensor.
@@ -221,7 +225,8 @@ class LinearLayer(nn.Module):
 
 
 class RadialEmbeddingLayer(nn.Module):
-    """Non-linear embedding layer for the radial part.
+    """
+    Non-linear embedding layer for the radial part.
 
     Adapted from MACE (https://github.com/ACEsuit/mace/blob/main/mace/modules/blocks.py).
     
@@ -230,16 +235,19 @@ class RadialEmbeddingLayer(nn.Module):
         n_basis (int): Number of radial basis functions.
         n_polynomial_cutoff (int): Parameter `p` of the envelope function.
     """
-    def __init__(self,
-                 r_cutoff: float,
-                 n_basis: int,
-                 n_polynomial_cutoff: int):
+    def __init__(
+        self,
+        r_cutoff: float,
+        n_basis: int,
+        n_polynomial_cutoff: int
+    ):
         super(RadialEmbeddingLayer, self).__init__()
         self.bessel_fn = BesselRBF(r_cutoff=r_cutoff, n_basis=n_basis)
         self.cutoff_fn = PolynomialCutoff(r_cutoff=r_cutoff, p=n_polynomial_cutoff)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Applies the non-linear embedding layer to the input tensor.
+        """
+        Applies the non-linear embedding layer to the input tensor.
 
         Args:
             x (torch.Tensor): Input tensor.
@@ -252,8 +260,93 @@ class RadialEmbeddingLayer(nn.Module):
         return radial * cutoff
     
 
+class ChargeEmbeddingLayer(nn.Module):
+    """
+    Basic class for charge embeddings.
+    
+    Based on Unke, O. T., Chmiela, S., Gastegger, M. et al. Nat. Commun. 12, 7273 (2021).
+
+    Args:
+        in_features (int): Number of input features.
+        out_features (int): Number of output features.
+        charge_MLP (int, optional): List of hidden features for the charge embedding network.
+    """
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        charge_MLP: List[int],
+    ):
+        super(ChargeEmbeddingLayer, self).__init__()
+        # initialize linear layers for queries (q), keys (k), and values (v)
+        self.linear_q = LinearLayer(in_features, out_features)
+        self.linear_k = LinearLayer(2, out_features)
+        self.linear_v = LinearLayer(2, out_features)
+        
+        # initialize charge embedding MLP
+        layers = []
+        for in_size, out_size in zip([out_features] + charge_MLP,
+                                     charge_MLP + [out_features]):
+            layers.append(LinearLayer(in_size, out_size))
+            layers.append(RescaledSiLULayer())
+        
+        self.mlp = nn.Sequential(*layers[:-1])
+        
+        # initialize the output linear layer
+        self.linear_out = LinearLayer(out_features, out_features)
+        
+    @torch.compiler.disable(recursive=False)
+    def forward(
+        self,
+        node_feats: torch.Tensor,
+        graph: Dict[str, torch.Tensor],
+        eps: float = 1e-12
+    ):
+        """
+        Computes charge embeddings.
+        
+        NOTE: Torch compiler is disabled because some tensors do not stay in the graph due to a bug. 
+        This ensures correct execution by preventing unexpected optimizations that might lead to 
+        incorrect results.
+
+        Parameters:
+            node_feats (torch.Tensor):  Node features (node embeddings).
+            graph (Dict[str, torch.Tensor]): Dictionary containing atomic data.
+            eps (float): Small value to prevent division by zero. Defaults to 1e-12.
+
+        Returns:
+            torch.Tensor: Charge embeddings.
+        """
+        if 'total_charge' not in graph:
+            raise RuntimeError("Total charges are required to compute the charge embeddings!")
+        total_charge, batch, n_atoms = graph['total_charge'], graph['batch'], graph['n_atoms']
+        
+        # encode positive / negative total charges
+        e = F.relu(torch.stack([total_charge, -total_charge], dim=-1))
+        enorm = torch.maximum(e, torch.ones_like(e))
+        
+        # linear transformations for queries (q), keys (k), and values (v)
+        # shape: batch x n_feats
+        q = self.linear_q(node_feats)  
+        k = self.linear_k(e / enorm).index_select(0, batch)
+        Qv = self.linear_v(e).index_select(0, batch)
+        
+        # compute the scaled dot product between q and k
+        dot = torch.sum(k * q, dim=-1) / k.shape[-1] ** 0.5
+        
+        # apply the softplus activation function and compute the norm
+        a = F.softplus(dot)
+        anorm = segment_sum(a, batch, n_atoms.shape[0], 0).index_select(0, batch)
+        
+        # scale v with normalized attention scores
+        a_Qv = (a / (anorm + eps)).unsqueeze(-1) * Qv
+        
+        return self.linear_out(self.mlp(a_Qv) + a_Qv)
+
+
 class ProductBasisLayer(nn.Module):
-    """Equivariant product basis layer with contractions based on the tensor product between 
+    """
+    Equivariant product basis layer with contractions based on the tensor product between 
     irreducible Cartesian tensors.
         
     Args:
@@ -270,16 +363,18 @@ class ProductBasisLayer(nn.Module):
                                   the number of possible tensor contractions.
         use_sc (bool): If True, use self-connection.
     """
-    def __init__(self,
-                 l_max_node_feats: int,
-                 l_max_target_feats: int,
-                 in_features: int,
-                 out_features: int,
-                 n_species: int,
-                 correlation: int,
-                 coupled_feats: bool,
-                 symmetric_product: bool,
-                 use_sc: bool):
+    def __init__(
+        self,
+        l_max_node_feats: int,
+        l_max_target_feats: int,
+        in_features: int,
+        out_features: int,
+        n_species: int,
+        correlation: int,
+        coupled_feats: bool,
+        symmetric_product: bool,
+        use_sc: bool
+    ):
         super(ProductBasisLayer, self).__init__()
         self.use_sc = use_sc
         
@@ -293,11 +388,14 @@ class ProductBasisLayer(nn.Module):
         self.linear = LinearTransform(in_l_max=l_max_target_feats, out_l_max=l_max_target_feats, 
                                       in_features=in_features, out_features=out_features)
     
-    def forward(self, 
-                node_feats: torch.Tensor,
-                sc: Optional[torch.Tensor],
-                node_attrs: torch.Tensor) -> torch.Tensor:
-        """Computes the product basis.
+    def forward(
+        self, 
+        node_feats: torch.Tensor,
+        sc: Optional[torch.Tensor],
+        node_attrs: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Computes the product basis.
 
         Args:
             node_feats (torch.Tensor): Node features (node embeddings).
@@ -317,7 +415,8 @@ class ProductBasisLayer(nn.Module):
 
 
 class InteractionLayer(nn.Module):
-    """Equivariant interaction layer with the convolution based on the tensor product between 
+    """
+    Equivariant interaction layer with the convolution based on the tensor product between 
     irreducible Cartesian tensors/Cartesian harmonics.
 
     Args:
@@ -334,17 +433,19 @@ class InteractionLayer(nn.Module):
         avg_n_neighbors (float): Average number of neighbors.
         radial_MLP (List[int]): List of hidden features for the radial embedding network.
     """
-    def __init__(self,
-                 l_max_node_feats: int,
-                 l_max_edge_attrs: int,
-                 l_max_target_feats: int,
-                 l_max_hidden_feats: int,
-                 n_basis: int,
-                 n_species: int,
-                 in_features: int,
-                 out_features: int,
-                 avg_n_neighbors: float,
-                 radial_MLP: List[int]):
+    def __init__(
+        self,
+        l_max_node_feats: int,
+        l_max_edge_attrs: int,
+        l_max_target_feats: int,
+        l_max_hidden_feats: int,
+        n_basis: int,
+        n_species: int,
+        in_features: int,
+        out_features: int,
+        avg_n_neighbors: float,
+        radial_MLP: List[int]
+    ):
         super(InteractionLayer, self).__init__()
         self.l_max_node_feats = l_max_node_feats
         self.l_max_edge_attrs = l_max_edge_attrs
@@ -363,14 +464,17 @@ class InteractionLayer(nn.Module):
         """Setup specific to the interaction layer."""
         raise NotImplementedError()
         
-    def forward(self,
-                node_attrs: torch.Tensor,
-                node_feats: torch.Tensor,
-                edge_attrs: torch.Tensor,
-                edge_feats: torch.Tensor,
-                idx_i: torch.Tensor,
-                idx_j: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Computes the output of the interaction layer.
+    def forward(
+        self,
+        node_attrs: torch.Tensor,
+        node_feats: torch.Tensor,
+        edge_attrs: torch.Tensor,
+        edge_feats: torch.Tensor,
+        idx_i: torch.Tensor,
+        idx_j: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Computes the output of the interaction layer.
 
         Args:
             node_attrs (torch.Tensor): Node attributes, e.g., one-hot encoded species.
@@ -404,7 +508,7 @@ class RealAgnosticResidualInteractionLayer(InteractionLayer):
                                      self.radial_MLP + [self.conv_tp.n_total_paths * self.in_features]):
             layers.append(LinearLayer(in_size, out_size))
             layers.append(RescaledSiLULayer())
-        self.conv_tp_weights = torch.nn.Sequential(*layers[:-1])
+        self.conv_tp_weights = nn.Sequential(*layers[:-1])
 
         # second linear layer
         self.linear_second = LinearTransform(in_l_max=self.l_max_target_feats, out_l_max=self.l_max_target_feats, 
@@ -416,13 +520,15 @@ class RealAgnosticResidualInteractionLayer(InteractionLayer):
                                              in1_features=self.in_features, in2_features=self.n_species, out_features=self.in_features,
                                              connection_mode='uvw', internal_weights=True, shared_weights=True)
 
-    def forward(self,
-                node_attrs: torch.Tensor,
-                node_feats: torch.Tensor,
-                edge_attrs: torch.Tensor,
-                edge_feats: torch.Tensor,
-                idx_i: torch.Tensor,
-                idx_j: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        node_attrs: torch.Tensor,
+        node_feats: torch.Tensor,
+        edge_attrs: torch.Tensor,
+        edge_feats: torch.Tensor,
+        idx_i: torch.Tensor,
+        idx_j: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # shape: n_atoms x n_feats * (1 + 3 + 3^2 + ...)
         sc = self.skip_tp(node_feats, node_attrs)
         
@@ -445,23 +551,29 @@ class RealAgnosticResidualInteractionLayer(InteractionLayer):
 
 
 class ScaleShiftLayer(nn.Module):
-    """Re-scales and shifts atomic energies predicted by the model.
+    """
+    Re-scales and shifts atomic energies predicted by the model.
     
     Args:
         shift_param (float): Parameter by which atomic energies should be shifted.
         scale_param (float): Parameter by which atomic energies should be scaled.
     """
-    def __init__(self,
-                 shift_params: np.ndarray,
-                 scale_params: np.ndarray):
+    def __init__(
+        self,
+        shift_params: np.ndarray,
+        scale_params: np.ndarray
+    ):
         super().__init__()
         self.register_buffer("scale_params", torch.tensor(scale_params, dtype=torch.get_default_dtype()))
         self.register_buffer("shift_params", torch.tensor(shift_params, dtype=torch.get_default_dtype()))
 
-    def forward(self, 
-                x: torch.Tensor,
-                graph: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Re-scales and shifts the ouptput of the atomistic model.
+    def forward(
+        self, 
+        x: torch.Tensor,
+        graph: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Re-scales and shifts the ouptput of the atomistic model.
 
         Args:
             x (torch.Tensor): Iutput of the atomistic model.

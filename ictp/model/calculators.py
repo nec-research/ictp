@@ -11,7 +11,7 @@
             Nicolas Weber (nicolas.weber@neclab.eu)
             Mathias Niepert (mathias.niepert@ki.uni-stuttgart.de)
 
-NEC Laboratories Europe GmbH, Copyright (c) 2024, All rights reserved.  
+NEC Laboratories Europe GmbH, Copyright (c) 2025, All rights reserved.  
 
        THIS HEADER MAY NOT BE EXTRACTED OR MODIFIED IN ANY WAY.
  
@@ -150,7 +150,7 @@ arrangements between the parties relating hereto.
 
        THIS HEADER MAY NOT BE EXTRACTED OR MODIFIED IN ANY WAY.
 """
-from typing import Dict, Union, Any, List, Tuple, Optional
+from typing import Dict, Union, Any, List, Tuple
 
 import torch
 
@@ -161,12 +161,14 @@ from ictp.utils.torch_geometric import Data
 
 
 class TorchCalculator:
-    """Computes atomic properties, e.g., (total) energy, atomic forces, stress.
-    """
-    def __call__(self,
-                 graph: Data,
-                 **kwargs: Any) -> Dict[str, Union[torch.Tensor, Any]]:
-        """Performs calculation on the provided (batch) graph data.
+    """Computes atomic properties, e.g., (total) energy, atomic forces, stress."""
+    def __call__(
+        self,
+        graph: Data,
+        **kwargs: Any
+    ) -> Dict[str, Union[torch.Tensor, Any]]:
+        """
+        Performs calculation on the provided (batch) graph data.
 
         Args:
             graph (Data): Atomic data graph.
@@ -177,7 +179,8 @@ class TorchCalculator:
         raise NotImplementedError()
 
     def get_device(self) -> str:
-        """Provides the device on which calculations are performed.
+        """
+        Provides the device on which calculations are performed.
         
         Returns: 
             str: Device on which calculations are performed.
@@ -185,7 +188,8 @@ class TorchCalculator:
         raise NotImplementedError()
 
     def to(self, device: str) -> 'TorchCalculator':
-        """Moves the calculator to the provided device.
+        """
+        Moves the calculator to the provided device.
         
         Args:
             device: Device to which calculator has to be moved.
@@ -196,20 +200,23 @@ class TorchCalculator:
         raise NotImplementedError()
 
 
-def prepare_gradients(graph: Data,
-                      forces: bool = False,
-                      stress: bool = False,
-                      virials: bool = False) -> Tuple[Data, List[str]]:
-    """Prepares gradient calculation by setting `requires_grad=True` for the selected atomic features. 
+def prepare_gradients(
+    graph: Data,
+    forces: bool = False,
+    stress: bool = False,
+    virials: bool = False
+) -> Tuple[Data, List[str]]:
+    """
+    Prepares gradient calculation by setting `requires_grad=True` for the selected atomic features. 
 
     Args:
         graph (Data): Atomic data graph.
-        forces (bool): If True, gradients with respect to positions/coordinates are calculated. 
-                       Defaults to False.
-        stress (bool): If True, gradients with respect to strain deformations are calculated. 
-                       Defaults to False.
-        virials (bool): If True, gradients with respect to strain deformations are calculated. 
-                        Defaults to False.
+        forces (bool): 
+            If True, gradients with respect to positions/coordinates are calculated. Defaults to False.
+        stress (bool): 
+            If True, gradients with respect to strain deformations are calculated. Defaults to False.
+        virials (bool): 
+            If True, gradients with respect to strain deformations are calculated. Defaults to False.
     
         Returns:
             Tuple[Data, List[str]]: Updated graph and list of properties which require gradients.
@@ -239,64 +246,113 @@ def prepare_gradients(graph: Data,
             # update the shifts
             symmetric_strain_ij = symmetric_strain_i.index_select(0, graph.edge_index[0, :])
             graph.shifts = graph.shifts + torch.matmul(graph.shifts.unsqueeze(-2), symmetric_strain_ij).squeeze(-2)
+    
     return graph, require_gradients
 
 
 class StructurePropertyCalculator(TorchCalculator):
-    """Calculates total energy, atomic forces, stress tensors from atomic energies.
+    """
+    Calculates total energy, atomic forces, stress tensors from atomic energies.
 
     Args:
-        model (ForwardAtomisticNetwork): Forward atomistic neural network object (provides atomic/node energies).
+        model (ForwardAtomisticNetwork): 
+            Forward atomistic neural network object (provides atomic/node energies).
+        with_torch_script (bool, optional): If True, the model is compiled using torch.jit.script().
+                                            Defaults to False.
+        with_torch_compile (bool, optional): If True, the model is compiled using torch.compile().
+                                                Defaults to False.
     """
-    def __init__(self,
-                 model: ForwardAtomisticNetwork,
-                 training: bool = False,
-                 **config: Any):
-        self.model = torch.jit.script(model) if training else torch.compile(model, backend='inductor')
+    def __init__(
+        self,
+        model: ForwardAtomisticNetwork,
+        with_torch_script: bool = False,
+        with_torch_compile: bool = False,
+        **config: Any
+    ):
+        if with_torch_script and with_torch_compile:
+            raise ValueError(
+                "Only one of `with_torch_script` or `with_torch_compile` can be True. "
+                f"Provided: {with_torch_script=} and {with_torch_compile=}"
+            )
+        
+        if with_torch_script:
+            self.model = torch.jit.script(model)
+        elif with_torch_compile:
+            torch.compiler.reset()
+            self.model = torch.compile(model, backend='inductor')
+        else:
+            self.model = model
 
-    def __call__(self,
-                 graph: Data,
-                 forces: bool = False,
-                 stress: bool = False,
-                 virials: bool = False,
-                 create_graph: bool = False) -> Dict[str, torch.Tensor]:
-        """Performs calculations for the atomic data graph.
+    def __call__(
+        self,
+        graph: Data,
+        forces: bool = False,
+        stress: bool = False,
+        virials: bool = False,
+        dipole_moment: bool = False,
+        quadrupole_moment: bool = False,
+        create_graph: bool = False
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Performs calculations for the atomic data graph.
 
         Args:
             graph (Data): Atomic data graph.
             forces (bool): If True, atomic forces are computed. Defaults to False.
             stress (bool): If True, stress tensor is computed. Defaults to False.
             virials (bool): If True, virials = - stress * volume are computed. Defaults to False.
-            create_graph (bool): If True, computational graph is created allowing the computation of 
-                                 backward pass for multiple times. Defaults to False.
+            dipole_moment (bool): If True, dipole moment is computed. Defaults to False.
+            quadrupole_moment (bool): If True, quadrupole moment is computed. Defaults to False.
+            create_graph (bool): 
+                If True, computational graph is created allowing the computation of backward pass 
+                for multiple times. Defaults to False.
 
         Returns:
             Dict[str, torch.Tensor]: Results dict.
         """
         results = {}
+        
         # prepare graph and the list containing graph attributes requiring gradients
-        graph, require_gradients = prepare_gradients(graph=graph, forces=forces, stress=stress, virials=virials)
-        # compute atomic energy
-        atomic_energies = self.model(graph.to_dict())
-        results['atomic_energies'] = atomic_energies
-        # sum up atomic contributions for a structure
-        total_energies = segment_sum(atomic_energies, idx_i=graph.batch, dim_size=graph.n_atoms.shape[0])
-        # write total energy to results
+        graph, require_gradients = prepare_gradients(
+            graph=graph, 
+            forces=forces, 
+            stress=stress, 
+            virials=virials
+        )
+        
+        # compute atomic energies (partial charges and other energy contributions)
+        results = self.model(graph.to_dict())
+        atomic_energies = results['atomic_energies']
+        
+        # sum up atomic contributions for a structure and write it to results
+        total_energies = segment_sum(
+            atomic_energies, 
+            idx_i=graph.batch, 
+            dim_size=graph.n_atoms.shape[0]
+        )
         results['energy'] = total_energies
+        
         if require_gradients:
             # compute gradients wrt. positions, strain, etc.
-            grads = torch.autograd.grad([atomic_energies], [getattr(graph, key) for key in require_gradients],
-                                        torch.ones_like(atomic_energies), create_graph=create_graph)
+            grads = torch.autograd.grad(
+                [atomic_energies],
+                [getattr(graph, key) for key in require_gradients],
+                torch.ones_like(atomic_energies),
+                create_graph=create_graph
+            )
+            
         if forces:
             # compute forces as negative of the gradient wrt. positions
             results['forces'] = torch.neg(grads[0])
+            
         if virials:
-            # compute virials as negative of the gradient wrt. strain (note that other conventions are possible,
-            # but here we use virials = -1 * stress * volume)
+            # compute virials as negative of the gradient wrt. strain 
+            # NOTE: other conventions are possible, but here we use virials = -1 * stress * volume
             if grads[-1] is not None:
                 results['virials'] = torch.neg(grads[-1])
             else:
                 results['virials'] = torch.zeros_like(graph.cell)
+                
         if stress:
             # compute stress as -1 * virials / volume
             volume = torch.einsum('bi, bi -> b', graph.cell[:, 0, :],
@@ -305,11 +361,45 @@ class StructurePropertyCalculator(TorchCalculator):
                 results['stress'] = grads[-1] / volume[:, None, None]
             else:
                 results['stress'] = torch.zeros_like(graph.cell) / volume[:, None, None]
+        
+        if dipole_moment:
+            # ensure that partial charges are available for dipole moment computation
+            if 'partial_charges' not in results:
+                raise RuntimeError(
+                    "Dipole moment calculation requested, but 'partial_charges' are missing in 'results'!"
+                )
+            
+            # compute dipole moments as sum_u q_u * r_{u,i} (relative to the origin)
+            results['dipole_moment'] = segment_sum(
+                results['partial_charges'][:, None] * graph.positions, idx_i=graph.batch, dim_size=graph.n_atoms.shape[0]
+            )
+            
+        if quadrupole_moment:
+            # ensure that partial charges are available for quadrupole moment computation
+            if 'partial_charges' not in results:
+                raise RuntimeError(
+                    "Quadrupole moment calculation requested, but 'partial_charges' are missing in 'results'!"
+                )
+            
+            # compute quadrupole moments as sum_u q_u * (r_{u,i} * r_{u,j} - 1 / 3 * \delta_ij * sum_k r_{u,k}^2) (relative to the origin)
+            outer = torch.einsum('ai, aj -> aij', graph.positions, graph.positions)
+            tr = torch.einsum('aii, jk -> ajk', outer, torch.eye(3, device=graph.positions.device))
+            results['quadrupole_moment'] = segment_sum(
+                results['partial_charges'][:, None, None] * (outer - tr / 3.0), idx_i=graph.batch, dim_size=graph.n_atoms.shape[0]
+            )
+            
         return results
 
     def get_device(self) -> str:
         return self.model.get_device()
 
     def to(self, device: str) -> TorchCalculator:
-        self.model.to(device)
+        self.model = self.model.to(device)
+        
+        # explicitly move the buffers of pair_potentials to the correct device
+        if self.model.pair_potentials is not None:
+            for pair_potential in self.model.pair_potentials:
+                for buffer in pair_potential.buffers():
+                    buffer.data = buffer.data.to(device)
+        
         return self

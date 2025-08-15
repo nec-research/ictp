@@ -11,7 +11,7 @@
             Nicolas Weber (nicolas.weber@neclab.eu)
             Mathias Niepert (mathias.niepert@ki.uni-stuttgart.de)
 
-NEC Laboratories Europe GmbH, Copyright (c) 2024, All rights reserved.  
+NEC Laboratories Europe GmbH, Copyright (c) 2025, All rights reserved.  
 
        THIS HEADER MAY NOT BE EXTRACTED OR MODIFIED IN ANY WAY.
  
@@ -161,24 +161,33 @@ import numpy as np
 
 import torch
 import torch.nn as nn
+from torch.utils.data import Dataset
 
-from ictp.data.data import AtomicStructures
 from ictp.data.tools import get_avg_n_neighbors, get_energy_shift_per_atom, get_forces_rms
 
 from ictp.nn.layers import LinearLayer, RescaledSiLULayer, ScaleShiftLayer
 from ictp.nn.representations import CartesianMACE
 
+from ictp.model.pair_potentials import (ZBLRepulsionEnergy, 
+                                        CoulombElectrostaticEnergy,
+                                        EwaldElectrostaticEnergy, 
+                                        SPMEElectrostaticEnergy,
+                                        D4DispersionEnergy)
+from ictp.model.partial_charges import (CorrectedPartialCharges, 
+                                        EquilibratedPartialCharges)
+
 from ictp.utils.misc import load_object, save_object
+from ictp.utils.torch_geometric import DataLoader
 
 
-def build_model(atomic_structures: Optional[AtomicStructures] = None,
-                **config: Any):
-    """Builds feed-forward atomistic neural network from the config file.
+def build_model(dataset: Optional[Dataset] = None, **config: Any) -> 'ForwardAtomisticNetwork':
+    """
+    Builds a feed-forward atomistic neural network from the configuration (`config`) file.
 
     Args:
-        atomic_structures (Optional[AtomicStructures], optional): Atomic structures, typically those from the training data sets, 
-                                                                  used to compute scale and shift for model predictions as well as 
-                                                                  the average number of neighbors. Defaults to None.
+        dataset (Optional[Dataset], optional): 
+            Atomic data set, typically the training data sets, used to compute scale and shift 
+            for model predictions as well as the average number of neighbors. Defaults to None.
         
     Returns:
         ForwardAtomisticNetwork: Atomistic neural network.
@@ -186,86 +195,291 @@ def build_model(atomic_structures: Optional[AtomicStructures] = None,
     torch.manual_seed(config['model_seed'])
     np.random.seed(config['model_seed'])
     
-    # compute scale/shift parameters for the total energy
-    # also, compute the average number of neighbors, i.e., the normalization factor for messages
-    if atomic_structures is None:
+    # compute scale/shift parameters for the energy and the average number of neighbors
+    if dataset is None:
         shift_params = np.zeros(config['n_species'])
         scale_params = np.ones(config['n_species'])
     else:
-        shift_params = get_energy_shift_per_atom(atomic_structures, n_species=config['n_species'], atomic_energies=config['atomic_energies'],
-                                                 compute_regression_shift=config['compute_regression_shift'])
-        scale_params = get_forces_rms(atomic_structures, n_species=config['n_species'])
+        data_loader = DataLoader(
+            dataset=dataset, 
+            batch_size=config['eval_batch_size'],
+            num_workers=config['n_workers'],
+            shuffle=False,
+            drop_last=False,
+        )
+        
+        shift_params = get_energy_shift_per_atom(
+            data_loader=data_loader,
+            n_species=config['n_species'],
+            atomic_energies=config['atomic_energies'],
+            compute_regression_shift=config['compute_regression_shift'],
+        )
+        scale_params = get_forces_rms(data_loader=data_loader, n_species=config['n_species'],)
+        
         if config['compute_avg_n_neighbors']:
-            config['avg_n_neighbors'] = get_avg_n_neighbors(atomic_structures, config['r_cutoff']).item()
+            config['avg_n_neighbors'] = get_avg_n_neighbors(data_loader)
 
-    # prepare (semi-)local atomic representation
+    # initialize representation layer
     representation = CartesianMACE(**config)
-
-    # prepare readouts
+    
+    # initialize partial charges module and define the number of outputs
+    partial_charges: Optional[nn.Module] = None
+    
+    if config['electrostatics']['method'] or config['dispersion']['method']:
+        if config['partial_charges'] == 'corrected':
+            n_outputs = 2
+            partial_charges = CorrectedPartialCharges()
+        elif config['partial_charges'] == 'equilibrated':
+            n_outputs = 3
+            partial_charges = EquilibratedPartialCharges()
+        else:
+            valid_values = ['corrected', 'equilibrated']
+            raise ValueError(
+                f"Invalid value for 'partial_charges': {config['partial_charges']}. "
+                f"Expected one of {valid_values}."
+            )
+    else:
+        n_outputs = 1
+    
+    # initialize pair potentials
+    pair_potentials = nn.ModuleList([])
+    
+    # add repulsion potential if specified
+    if config['repulsion']['method']:
+        if config['repulsion']['method'] == 'zbl':
+            pair_potentials.append(
+                ZBLRepulsionEnergy(
+                    r_cutoff=config['repulsion']['r_cutoff'],
+                    ke=config['ke'],
+                    n_polynomial_cutoff=config['repulsion']['n_polynomial_cutoff']
+                )
+            )
+        else:
+            valid_values = ['zbl']
+            raise ValueError(
+                f"Invalid value for {config['repulsion']['method']=}."
+                f"Expected one of {valid_values}."
+            )
+    
+    # add electrostatic potential if specified
+    if config['electrostatics']['method']:
+        if config['electrostatics']['method'] == 'coulomb':
+            pair_potentials.append(
+                CoulombElectrostaticEnergy(
+                    r_cutoff=config['electrostatics']['r_cutoff'],
+                    ke=config['ke'],
+                    exclusion_radius=config['exclusion_radius'],
+                    n_exclusion_polynomial_cutoff=config['n_exclusion_polynomial_cutoff']
+                )
+            )
+        elif config['electrostatics']['method'] == 'ewald':
+            pair_potentials.append(
+                EwaldElectrostaticEnergy(
+                    r_cutoff=config['electrostatics']['r_cutoff'],
+                    ke=config['ke'],
+                    alpha=config['electrostatics']['alpha'],
+                    k_max=config['electrostatics']['k_max'],
+                    exclusion_radius=config['exclusion_radius'],
+                    n_exclusion_polynomial_cutoff=config['n_exclusion_polynomial_cutoff']
+                )
+            )
+        elif config['electrostatics']['method'] == 'spme':
+            pair_potentials.append(
+                SPMEElectrostaticEnergy(
+                    r_cutoff=config['electrostatics']['r_cutoff'],
+                    ke=config['ke'],
+                    alpha=config['electrostatics']['alpha'],
+                    k_max=config['electrostatics']['k_max'],
+                    spline_order=config['electrostatics']['spline_order'],
+                    exclusion_radius=config['exclusion_radius'],
+                    n_exclusion_polynomial_cutoff=config['n_exclusion_polynomial_cutoff']
+                )
+            )
+        else:
+            valid_values = ['coulomb', 'ewald', 'spme']
+            raise ValueError(
+                f"Invalid value for {config['electrostatics']['method']=}. "
+                f"Expected one of {valid_values}."
+            )
+    
+    # add dispersion potential if specified
+    if config['dispersion']['method']:
+        if config['dispersion']['method'] == 'd4':
+            pair_potentials.append(
+                D4DispersionEnergy(
+                    r_cutoff=config['dispersion']['r_cutoff'],
+                    Z_max=config['Z_max'],
+                    Bohr=config['dispersion']['Bohr'],
+                    Hartree=config['dispersion']['Hartree'],
+                    exclusion_radius=config['exclusion_radius'],
+                    n_exclusion_polynomial_cutoff=config['n_exclusion_polynomial_cutoff']
+                )
+            )
+        else:
+            valid_values = ['d4']
+            raise RuntimeError(
+                f"Invalid value for {config['dispersion']['method']=}. "
+                f"Expected one of {valid_values}."
+            )
+    
+    # initialize scalar readouts
     readouts = nn.ModuleList([])
+    
     for i in range(config['n_interactions']):
         if i == config['n_interactions'] - 1:
             layers = []
-            for in_size, out_size in zip([config['n_hidden_feats']] + config['readout_MLP'],
-                                        config['readout_MLP'] + [1]):
+            
+            input_sizes = [config['n_hidden_feats']] + config['readout_MLP']
+            output_sizes = config['readout_MLP'] + [n_outputs]
+            for in_size, out_size in zip(input_sizes, output_sizes):
                 layers.append(LinearLayer(in_size, out_size))
                 layers.append(RescaledSiLULayer())
-            readouts.append(nn.Sequential(*layers[:-1]))
+            readouts.append(nn.Sequential(*layers[:-1]))    # exclude the last activation
         else:
-            readouts.append(LinearLayer(config['n_hidden_feats'], 1))
+            readouts.append(LinearLayer(config['n_hidden_feats'], n_outputs))
 
+    # initialize scale/shift layer
     scale_shift = ScaleShiftLayer(shift_params=shift_params, scale_params=scale_params)
 
-    return ForwardAtomisticNetwork(representation=representation, readouts=readouts, scale_shift=scale_shift, config=config)
+    return ForwardAtomisticNetwork(
+        representation=representation,
+        readouts=readouts,
+        scale_shift=scale_shift,
+        partial_charges=partial_charges,
+        pair_potentials=pair_potentials, 
+        config=config
+    )
 
 
 class ForwardAtomisticNetwork(nn.Module):
-    """An atomistic model based on feed-forward neural networks.
+    """
+    An atomistic model based on feed-forward neural networks.
 
     Args:
         representation (nn.Module): Local atomic representation layer.
         readouts (nn.ModuleList): List of readout layers.
-        scale_shift (nn.Module): Schale/shift transformation applied to the output, i.e., energy re-scaling and shift.
+        scale_shift (nn.Module): Schale/shift transformation layer.
+        partial_charges (nn.Module): Partial charges module.
+        pair_potentials (optional, nn.ModuleList): List of pair potentials.
+        config (Dict[str, Any]): Model configuration.
     """
-    def __init__(self,
-                 representation: nn.Module,
-                 readouts: List[nn.Module],
-                 scale_shift: nn.Module,
-                 config: Dict[str, Any]):
+    def __init__(
+        self,
+        representation: nn.Module,
+        readouts: nn.ModuleList,
+        scale_shift: nn.Module,
+        partial_charges: Optional[nn.Module],
+        pair_potentials: Optional[nn.ModuleList],
+        config: Dict[str, Any]
+    ):
         super().__init__()
-        # all necessary modules
+        # basic modules
         self.representation = representation
         self.readouts = readouts
         self.scale_shift = scale_shift
         
-        # provide config file to store it
+        # module for computing partial charges
+        self.partial_charges = partial_charges
+        
+        # pair potentials (optional): repulsion, electrostatics, and dispersion modules
+        # NOTE: we don't apply energy scale and shift parameters to the output of these modules 
+        #       as their outputs are already expected in correct units
+        self.pair_potentials = pair_potentials
+        
+        # provide configuration to store it
         self.config = config
 
-    def forward(self, graph: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Computes atomic energies for the provided batch.
+    def forward(self, graph: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Computes atomic energies for the provided batch.
 
         Args:
             graph (Dict[str, torch.Tensor]): Atomic data dictionary.
 
         Returns:
-            torch.Tensor: Atomic energies.
+            Dict[str, torch.Tensor]: Results dictionary containing atomic energies (and partial charges).
         """
-        # compute representation (atom/node features)
-        atom_feats_list = self.representation(graph)
+        results = {}
         
-        # apply a readout layer to each representation
-        atomic_energies_list = []
+        # prepare distances and distance vectors
+        edge_index, positions, shifts = graph['edge_index'], graph['positions'], graph['shifts']
+        
+        idx_i, idx_j = edge_index[0, :], edge_index[1, :]
+        vectors = positions.index_select(0, idx_i) - positions.index_select(0, idx_j) - shifts
+        lengths = torch.norm(vectors, dim=-1, keepdim=True) # TODO: Do we really need lengths of shape (n_batch, 1)?
+        graph['vectors'], graph['lengths'] = vectors, lengths
+        
+        # compute atom/node features
+        node_feats_list = self.representation(graph)
+        
+        # apply a readout layer to each atom/node features
+        node_outputs_list = []
         for i, readout in enumerate(self.readouts):
-            atomic_energies_list.append(readout(atom_feats_list[i]).squeeze(-1))
-        atomic_energies = torch.sum(torch.stack(atomic_energies_list, dim=0), dim=0)
+            node_outputs_list.append(readout(node_feats_list[i]))
+        node_outputs = torch.sum(torch.stack(node_outputs_list, dim=0), dim=0)
         
         # scale and shift the output
-        atomic_energies = self.scale_shift(atomic_energies, graph)
+        results = {'atomic_energies': self.scale_shift(node_outputs[:, 0], graph)}
         
-        return atomic_energies
+        # compute partial charges from node outputs
+        if self.partial_charges is not None:
+            results = self.partial_charges(node_outputs[:, 1:], graph, results)
+        
+        # apply pair potentials
+        for pair_potential in self.pair_potentials:
+            results = pair_potential(graph, results)
+                
+        return results
 
+    def replace_pair_potential(
+        self, 
+        new_pair_potential: Optional[nn.Module],
+        target_pair_potentials: List[str] = None
+    ) -> 'ForwardAtomisticNetwork':
+        """
+        Replaces an existing pair potential in `pair_potentials` that matches a target module name, 
+        or appends the new one if no match is found.
+
+        Args:
+            new_pair_potential (nn.Module): 
+                The new pair potential to replace or add. If None, removes the matching pair potential.
+            target_pair_potentials (List[str], optional): 
+                List of target module class names to replace. Defaults to ['CoulombElectrostaticEnergy', 
+                'EwaldElectrostaticEnergy', 'SPMEElectrostaticEnergy'].
+
+        Returns:
+            ForwardAtomisticNetwork: Forward model with updated pair potentials.
+        """
+        if target_pair_potentials is None:
+            target_pair_potentials = [
+                'CoulombElectrostaticEnergy',
+                'EwaldElectrostaticEnergy',
+                'SPMEElectrostaticEnergy'
+            ]
+        
+        if self.pair_potentials is None:
+            self.pair_potentials = nn.ModuleList([])
+        
+        if new_pair_potential is None:
+            self.pair_potentials = nn.ModuleList(
+                [module for module in self.pair_potentials if module.__class__.__name__ not in target_pair_potentials]
+            )
+        else:
+            replaced = False
+            for i, module in enumerate(self.pair_potentials):
+                if module.__class__.__name__ in target_pair_potentials:
+                    self.pair_potentials[i] = new_pair_potential
+                    replaced = True
+                    break
+            
+            if not replaced:
+                self.pair_potentials.append(new_pair_potential)
+            
+        return self
+        
     def get_device(self) -> str:
-        """Provides device on which calculations are performed.
+        """
+        Provides device on which calculations are performed.
         
         Returns: 
             str: Device on which calculations are performed.
@@ -273,36 +487,44 @@ class ForwardAtomisticNetwork(nn.Module):
         return list(self.representation.parameters())[0].device
 
     def load_params(self, file_path: Union[str, Path]):
-        """Loads network parameters from the file.
+        """
+        Loads network parameters from the file.
 
         Args:
-            file_path (Union[str, Path]): Path to the file where network parameters are stored.
+            file_path (Union[str, Path]): 
+                Path to the file where network parameters are stored.
         """
         self.load_state_dict(load_object(file_path))
 
     def save_params(self, file_path: Union[str, Path]):
-        """Stores network parameters to the file.
+        """
+        Stores network parameters to the file.
 
         Args:
-            file_path (Union[str, Path]): Path to the file where network parameters are stored.
+            file_path (Union[str, Path]): 
+                Path to the file where network parameters are stored.
         """
         save_object(file_path, self.state_dict())
 
     def save(self, folder_path: Union[str, Path]):
-        """Stores config and network parameters to the file.
+        """
+        Stores config and network parameters to the file.
 
         Args:
-            folder_path (Union[str, Path]): Path to the folder where network parameters are stored.
+            folder_path (Union[str, Path]): 
+                Path to the folder where network parameters are stored.
         """
         (Path(folder_path) / 'config.yaml').write_text(str(yaml.safe_dump(self.config)))
         self.save_params(Path(folder_path) / 'params.pkl')
 
     @staticmethod
     def from_folder(folder_path: Union[str, Path]) -> 'ForwardAtomisticNetwork':
-        """Loads model from the defined folder.
+        """
+        Loads model from the defined folder.
 
         Args:
-            folder_path (Union[str, Path]): Path to the folder where network parameters are stored.
+            folder_path (Union[str, Path]): 
+                Path to the folder where network parameters are stored.
 
         Returns:
             ForwardAtomisticNetwork: The `ForwardAtomisticNetwork` object.
@@ -314,10 +536,12 @@ class ForwardAtomisticNetwork(nn.Module):
 
 
 def find_last_ckpt(folder: Union[Path, str]):
-    """Finds the last/best checkpoint to load the model from.
+    """
+    Finds the last/best checkpoint to load the model from.
 
     Args:
-        folder (Union[Path, str]): Path to the folder where checkpoints are stored.
+        folder (Union[Path, str]): 
+            Path to the folder where checkpoints are stored.
 
     Returns:
         Last checkpoint to load the model from.
@@ -335,14 +559,14 @@ def find_last_ckpt(folder: Union[Path, str]):
         return files[0]
 
 
-def load_model_from_folder(model_path: Union[str, Path],
-                           key: str = 'best') -> ForwardAtomisticNetwork:
-    """Loads model from the provided folder.
+def load_model_from_folder(model_path: Union[str, Path], key: str = 'best') -> ForwardAtomisticNetwork:
+    """
+    Loads model from the provided folder.
 
     Args:
         model_path (Union[str, Path]): Path to the model.
-        key (str, optional): Choose which model to select, the best or last stored one: 'best' and 'log'. 
-                             Defaults to 'best'.
+        key (str, optional): 
+            Choose which model to select, the best or last stored one: 'best' and 'log'. Defaults to 'best'.
 
     Returns:
         ForwardAtomisticNetwork: Atomistic model.

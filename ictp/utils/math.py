@@ -11,7 +11,7 @@
             Nicolas Weber (nicolas.weber@neclab.eu)
             Mathias Niepert (mathias.niepert@ki.uni-stuttgart.de)
 
-NEC Laboratories Europe GmbH, Copyright (c) 2024, All rights reserved.  
+NEC Laboratories Europe GmbH, Copyright (c) 2025, All rights reserved.  
 
        THIS HEADER MAY NOT BE EXTRACTED OR MODIFIED IN ANY WAY.
  
@@ -150,6 +150,10 @@ arrangements between the parties relating hereto.
 
        THIS HEADER MAY NOT BE EXTRACTED OR MODIFIED IN ANY WAY.
 """
+from typing import *
+
+import numpy as np
+
 import torch
 
 
@@ -182,3 +186,73 @@ def _segment_sum(x: torch.Tensor,
     tmp = torch.zeros(shape, dtype=x.dtype, device=x.device)
     y = tmp.index_add(dim, idx_i, x)
     return y
+
+
+def softplus_inverse(x: Union[List, Union[torch.Tensor, np.ndarray]]) -> torch.Tensor:
+    """Inverse of the softplus function. This is useful for initialization of
+    parameters that are constrained to be positive (via softplus).
+    
+    Adapted from SpookyNet (https://github.com/OUnke/SpookyNet/blob/main/spookynet/functional.py).
+    
+    Args:
+        x (Union[List, Union[torch.Tensor, np.ndarray]]): Input tensor.
+        
+    Returns:
+        torch.Tensor: Inverse softplus of the input.
+    """
+    if not isinstance(x, torch.Tensor):
+        x = torch.tensor(x, dtype=torch.get_default_dtype())
+    return x + torch.log(-torch.expm1(-x))
+
+
+def _switch_component(r: torch.Tensor, 
+                      ones: torch.Tensor, 
+                      zeros: torch.Tensor) -> torch.Tensor:
+    """Component of the switch function, only for internal use.
+    
+    Adapted from SpookyNet (https://github.com/OUnke/SpookyNet/blob/main/spookynet/functional.py).
+    
+    Args:
+        r (torch.Tensor): Input tensor (pair distances).
+        ones (torch.Tensor): Tensor containing ones.
+        zeros (torch.Tensor): Tensor containing zeros.
+    
+    Returns:
+        torch.Tensor: 
+    """
+    r_ = torch.where(r <= 0, ones, r)  # prevent nan in backprop
+    return torch.where(r <= 0, zeros, torch.exp(-ones / r_))
+
+
+def switch_function(r: torch.Tensor, 
+                    switch_on: float, 
+                    switch_off: float) -> torch.Tensor:
+    """Switch function that smoothly (and symmetrically) goes from f(r) = 1 to
+    f(r) = 0 in the interval from r = switch_on to r = switch_off. For r <= switch_on,
+    f(r) = 1 and for r >= switch_off, f(x) = 0. This switch function has infinitely
+    many smooth derivatives.
+    
+    NOTE: The implementation with the "_switch_component" function is
+    numerically more stable than a simplified version, it is not recommended 
+    to change this!
+    
+    Adapted from SpookyNet (https://github.com/OUnke/SpookyNet/blob/main/spookynet/functional.py).
+    
+    We use this function to smoothly interpolate between the correct 1/r behavior of 
+    Coulomb's law at large distances (r > switch_off) and a damped 1 / (r^2 + 1)^0.5 dependence
+    at short distances (r < switch_on)
+    
+    Args:
+        r (torch.Tensor): 
+        switch_on (float):
+        switch_off (float): 
+        
+    Returns:
+        torch.Tnesor: 
+    """
+    r = (r - switch_on) / (switch_off - switch_on)
+    ones = torch.ones_like(r)
+    zeros = torch.zeros_like(r)
+    fp = _switch_component(r, ones, zeros)
+    fm = _switch_component(1 - r, ones, zeros)
+    return torch.where(r <= 0, ones, torch.where(r >= 1, zeros, fm / (fp + fm)))

@@ -157,10 +157,9 @@ from typing import Dict, Optional, Union, Any
 import numpy as np
 
 import torch
+from torch.utils.data import Dataset, Subset
 
 import ase
-
-from ictp.data.data import AtomicStructures, AtomicTypeConverter
 
 from ictp.model.calculators import StructurePropertyCalculator
 from ictp.model.forward import ForwardAtomisticNetwork, build_model, load_model_from_folder
@@ -175,88 +174,119 @@ from ictp.utils.torch_geometric import DataLoader
 
 
 class TrainingStrategy:
-    """Strategy for training interatomic potentials.
+    """
+    Strategy for training interatomic potentials.
 
     Args:
-        config (Optional[Dict[str, Any]], optional): Configuration file with parameters listed in 'utils/config.py'. 
-                                                     The default parameters of 'utils/config.py' will be updated by 
-                                                     those provided in 'config'. Defaults to None.
+        config (Optional[Dict[str, Any]], optional): 
+            Configuration file with parameters listed in 'utils/config.py'. The default parameters of 'utils/config.py' 
+            will be updated by those provided in 'config'. Defaults to None.
     """
     def __init__(self, config: Optional[Dict[str, Any]] = None):
-        # Update config containing all parameters (including the model, training, fine-tuning, and evaluation)
-        # We store all parameters in one config for simplicity. In the log and best folders the last training
-        # config is stored and used when loading a model for inference.
+        # initialize and update the configuration with provided parameters (including the model, training, fine-tuning, and evaluation)
+        # all parameters, including those for the model, training, fine-tuning, and evaluation, are stored in `config`
+        # the last training configuration is saved in the log and best folders for use during inference
         self.config = update_config(config.copy())
 
-    def run(self,
-            train_structures: AtomicStructures,
-            valid_structures: AtomicStructures,
-            folder: Union[str, Path],
-            model_seed: Optional[int] = None) -> ForwardAtomisticNetwork:
-        """Runs training using provided training and validation structures.
+    def run(
+        self,
+        train_dataset: Dataset,
+        valid_dataset: Dataset,
+        folder: Union[str, Path],
+        model_seed: Optional[int] = None,
+        with_torch_script: bool = False,
+        with_torch_compile: bool = False,
+    ) -> ForwardAtomisticNetwork:
+        """
+        Runs training using provided training and validation data sets.
 
         Args:
-            train_structures (AtomicStructures): Training structures.
-            valid_structures (AtomicStructures): Validation structures.
-            folder (Union[str, Path]): Folder where the trained model is stored.
-            model_seed (int, optional): Random seed to initialize the atomistic model. Defaults to None.
+            train_dataset (Dataset): The data set for training.
+            valid_dataset (Dataset): The data set for validation.
+            folder (Union[str, Path]): The directory where the trained model will be stored.
+            model_seed (int, optional): Random seed for initializing the atomistic model. Defaults to None.
+            with_torch_script (bool, optional): If True, the model is compiled using torch.jit.script().
+                                                Defaults to False.
+            with_torch_compile (bool, optional): If True, the model is compiled using torch.compile().
+                                                 Defaults to False.
 
         Returns:
-            ForwardAtomisticNetwork: Trained atomistic model.
+            ForwardAtomisticNetwork: The trained atomistic model.
         """
-        # define atomic type converter
-        atomic_type_converter = AtomicTypeConverter.from_type_list(self.config['atomic_types'])
+        # store data set sizes in the configuration
+        n_train = len(train_dataset)
+        n_valid = len(valid_dataset)
+        self.config['n_train'] = n_train
+        self.config['n_valid'] = n_valid
         
-        # convert atomic numbers to type names
-        train_structures = train_structures.to_type_names(atomic_type_converter, check=True)
-        valid_structures = valid_structures.to_type_names(atomic_type_converter, check=True)
+        # retrieve the atomic type converter from the data set
+        atomic_type_converter = (
+            train_dataset.dataset.atomic_type_converter
+            if isinstance(train_dataset, Subset) else train_dataset.atomic_type_converter
+        )
         
-        # store the number of training and validation structures in config
-        self.config['n_train'] = len(train_structures)
-        self.config['n_valid'] = len(valid_structures)
-        
-        # build atomic data sets
-        train_ds = train_structures.to_data(r_cutoff=self.config['r_cutoff'], 
-                                            n_species=atomic_type_converter.get_n_type_names())
-        valid_ds = valid_structures.to_data(r_cutoff=self.config['r_cutoff'], 
-                                            n_species=atomic_type_converter.get_n_type_names())
-        
-        # update model seed if provided (can be used to re-run a calculation with a different seed) and build the model
+        # update the model seed if provided
         if model_seed is not None:
             self.config['model_seed'] = model_seed
-        model = build_model(train_structures, n_species=atomic_type_converter.get_n_type_names(), **self.config)
+        
+        # build the model using data set information and configuration
+        model = build_model(
+            dataset=train_dataset, 
+            n_species=atomic_type_converter.get_n_type_names(),
+            Z_max=int(atomic_type_converter._to_atomic_numbers.max()), 
+            **self.config,
+        )
             
-        # define losses from config
+        # define training and evaluation losses from configuration
         train_loss = config_to_loss(self.config['train_loss'])
         eval_losses = {l['type']: config_to_loss(l) for l in self.config['eval_losses']}
         early_stopping_loss = config_to_loss(self.config['early_stopping_loss'])
         
-        # define callbacks to track training
+        # set up callbacks for tracking training progress
         callbacks = [FileLoggingCallback()]
         
-        # define model training
-        trainer = Trainer(model, model_path=folder, callbacks=callbacks, 
-                          lr=self.config['lr'], lr_factor=self.config['lr_factor'], scheduler_patience=self.config['scheduler_patience'], 
-                          max_epoch=self.config['max_epoch'], save_epoch=self.config['save_epoch'], validate_epoch=self.config['valid_epoch'],
-                          train_batch_size=min(self.config['train_batch_size'], len(train_structures)),
-                          valid_batch_size=min(self.config['eval_batch_size'], len(valid_structures)),
-                          train_loss=train_loss, eval_losses=eval_losses, early_stopping_loss=early_stopping_loss,
-                          max_grad_norm=self.config['max_grad_norm'], device=self.config['device'], 
-                          amsgrad=self.config['amsgrad'], weight_decay=self.config['weight_decay'],
-                          ema=self.config['ema'], ema_decay=self.config['ema_decay'])
+        # configure the trainer with model and training parameters
+        trainer = Trainer(
+            model=model,
+            model_path=folder,
+            callbacks=callbacks,
+            lr=self.config['lr'],
+            lr_factor=self.config['lr_factor'],
+            scheduler_patience=self.config['scheduler_patience'],
+            max_epoch=self.config['max_epoch'],
+            save_epoch=self.config['save_epoch'],
+            validate_epoch=self.config['valid_epoch'],
+            train_batch_size=min(self.config['train_batch_size'], n_train),
+            valid_batch_size=min(self.config['eval_batch_size'], n_valid),
+            n_workers=self.config['n_workers'],
+            train_loss=train_loss,
+            eval_losses=eval_losses,
+            early_stopping_loss=early_stopping_loss,
+            max_grad_norm=self.config['max_grad_norm'],
+            device=self.config['device'],
+            amsgrad=self.config['amsgrad'],
+            weight_decay=self.config['weight_decay'],
+            ema=self.config['ema'],
+            ema_decay=self.config['ema_decay'],
+            with_sam=self.config['with_sam'],
+            rho_sam=self.config['rho_sam'],
+            adaptive_sam=self.config['adaptive_sam'],
+            with_torch_script=with_torch_script,
+            with_torch_compile=with_torch_compile,
+        )
         
-        # train the model
-        trainer.fit(train_ds=train_ds, valid_ds=valid_ds)
+        # Train the model
+        trainer.fit(train_dataset=train_dataset, valid_dataset=valid_dataset)
         
-        # return best models and move them to device
-        model = load_model_from_folder(folder, key='best')
-        model = model.to(self.config['device'])
+        # Load the best model and move it to the specified device
+        model = load_model_from_folder(folder, key='best').to(self.config['device'])
         
         return model
 
 
 class EvaluationStrategy:
-    """Strategy for evaluating the performance of interatomic potentials.
+    """
+    Strategy for evaluating the performance of interatomic potentials.
 
     Args:
         config (Optional[Dict[str, Any]], optional): Configuration file with parameters listed in 'utils/config.py'. 
@@ -264,21 +294,30 @@ class EvaluationStrategy:
                                                      provided in 'config'. Defaults to None.
     """
     def __init__(self, config: Optional[Dict[str, Any]] = None):
-        # Update config containing all parameters (including the model, training, fine-tuning, and evaluation)
-        # We store all parameters in one config for simplicity. In the log and best folders the last training
-        # config is stored and used when loading a model for inference.
+        # update config containing all parameters (including the model, training, fine-tuning, and evaluation)
+        # we store all parameters in one config for simplicity. In the log and best folders the last training
+        # configuration is stored and used when loading a model for inference.
         self.config = update_config(config.copy())
 
-    def run(self,
-            model: ForwardAtomisticNetwork,
-            test_structures: AtomicStructures,
-            folder: Union[str, Path]) -> Dict[str, Any]:
-        """Evaluates models using the provided test data set.
+    def run(
+        self,
+        model: ForwardAtomisticNetwork,
+        test_dataset: Dataset,
+        folder: Union[str, Path],
+        with_torch_script: bool = False,
+        with_torch_compile: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Evaluates models using the provided test data set.
 
         Args:
             model (ForwardAtomisticNetwork): Atomistic model.
-            test_structures (AtomicStructures): Test structures.
+            test_dataset (Dataset): Test data set.
             folder (Union[str, Path]): Folder where the evaluation results are stored.
+            with_torch_script (bool, optional): If True, the model is compiled using torch.jit.script().
+                                                Defaults to False.
+            with_torch_compile (bool, optional): If True, the model is compiled using torch.compile().
+                                                 Defaults to False.
 
         Returns:
             Dict[str, Any]: Results dictionary containing test error metrics.
@@ -286,17 +325,11 @@ class EvaluationStrategy:
         folder = Path(folder)
         
         # apply property and ensemble calculators to models
-        calc = StructurePropertyCalculator(model, training=False).to(self.config['device'])
-        
-        # define atomic type converter
-        atomic_type_converter = AtomicTypeConverter.from_type_list(self.config['atomic_types'])
-        
-        # convert atomic numbers to type names
-        test_structures = test_structures.to_type_names(atomic_type_converter, check=True)
-        
-        # build atomic data sets
-        test_ds = test_structures.to_data(r_cutoff=self.config['r_cutoff'],
-                                          n_species=atomic_type_converter.get_n_type_names())
+        calc = StructurePropertyCalculator(
+            model=model,
+            with_torch_script=with_torch_script,
+            with_torch_compile=with_torch_compile
+        ).to(self.config['device'])
         
         # define losses from config
         eval_losses = {l['type']: config_to_loss(l) for l in self.config['eval_losses']}
@@ -304,45 +337,61 @@ class EvaluationStrategy:
         
         # evaluate model on the test data
         use_gpu = self.config['device'].startswith('cuda')
-        test_dl = DataLoader(test_ds, batch_size=self.config['eval_batch_size'], shuffle=False, drop_last=False,
-                             pin_memory=use_gpu, pin_memory_device=self.config['device'] if use_gpu else '')
+        test_dl = DataLoader(
+            dataset=test_dataset, 
+            batch_size=self.config['eval_batch_size'], 
+            num_workers=0, 
+            shuffle=False, 
+            drop_last=False,
+            pin_memory=use_gpu, 
+            pin_memory_device=self.config['device'] if use_gpu else ''
+        )
         
         # evaluate metrics on test data and store results as a .json file
-        test_metrics = eval_metrics(calc=calc, dl=test_dl, eval_loss_fns=eval_losses,
-                                    eval_output_variables=eval_output_variables, device=self.config['device'])
+        test_metrics = eval_metrics(
+            calc=calc, 
+            dl=test_dl, 
+            eval_loss_fns=eval_losses,
+            eval_output_variables=eval_output_variables, 
+            device=self.config['device']
+        )
         save_object(folder / f'test_results.json', test_metrics['eval_losses'], use_json=True)
         
         return test_metrics['eval_losses']
 
-    def run_on_configs(self,
-                       model: ForwardAtomisticNetwork,
-                       test_structures: AtomicStructures,
-                       folder: Union[str, Path],
-                       file_name: str):
-        """Evaluates models on the provided test data set and stores configurations in an .xyz file with predicted total energies and atomic forces.
+    def run_on_configs(
+        self,
+        model: ForwardAtomisticNetwork,
+        test_dataset: Dataset,
+        folder: Union[str, Path],
+        file_name: str,
+        with_torch_script: bool = False,
+        with_torch_compile: bool = False,
+    ):
+        """
+        Evaluates models on the provided test data set and stores configurations in an .xyz file with predicted total energies and atomic forces.
 
         Args:
             model (ForwardAtomisticNetwork): Atomistic model.
-            test_structures (AtomicStructures): Test structures.
+            test_dataset (Dataset): Test data set.
             folder (Union[str, Path]): Folder where the evaluation results are stored.
             file_name (str): Name of the .xyz file, which stores predicted total energies and atomic forces.
+            with_torch_script (bool, optional): If True, the model is compiled using torch.jit.script().
+                                                Defaults to False.
+            with_torch_compile (bool, optional): If True, the model is compiled using torch.compile().
+                                                 Defaults to False.
+            
         """
         folder = Path(folder)
-        
-        atoms_list = [s.to_atoms() for s in test_structures]
+            
+        atoms_list = [d.to_atoms() for d in test_dataset]
         
         # apply property and ensemble calculators to models
-        calc = StructurePropertyCalculator(model, training=False).to(self.config['device'])
-        
-        # define atomic type converter
-        atomic_type_converter = AtomicTypeConverter.from_type_list(self.config['atomic_types'])
-        
-        # convert atomic numbers to type names
-        test_structures = test_structures.to_type_names(atomic_type_converter, check=True)
-        
-        # build atomic data sets
-        test_ds = test_structures.to_data(r_cutoff=self.config['r_cutoff'],
-                                          n_species=atomic_type_converter.get_n_type_names())
+        calc = StructurePropertyCalculator(
+            model=model,
+            with_torch_script=with_torch_script,
+            with_torch_compile=with_torch_compile
+        ).to(self.config['device'])
         
         # define losses from config
         eval_losses = {l['type']: config_to_loss(l) for l in self.config['eval_losses']}
@@ -350,67 +399,130 @@ class EvaluationStrategy:
         
         # evaluate model on the test data
         use_gpu = self.config['device'].startswith('cuda')
-        test_dl = DataLoader(test_ds, batch_size=self.config['eval_batch_size'], shuffle=False, drop_last=False,
-                             pin_memory=use_gpu, pin_memory_device=self.config['device'] if use_gpu else '')
+        test_dl = DataLoader(
+            dataset=test_dataset, 
+            batch_size=self.config['eval_batch_size'],
+            num_workers=0,
+            shuffle=False,
+            drop_last=False,
+            pin_memory=use_gpu,
+            pin_memory_device=self.config['device'] if use_gpu else ''
+        )
         
-        # Collect data
+        # collect data
         energies_list = []
         forces_collection = []
+        
+        partial_charges_collection = []
+        dipole_moments_list = []
+        quadrupole_moments_list = []
 
         for batch in test_dl:
             results = calc(batch.to(self.config['device']), 
                            forces='forces' in eval_output_variables,
                            stress='stress' in eval_output_variables,
                            virials='virials' in eval_output_variables,
-                           create_graph=True)
+                           dipole_moment='dipole_moment' in eval_output_variables,
+                           quadrupole_moment='quadrupole_moment' in eval_output_variables,
+                           create_graph=False)
 
             energies_list.append(results['energy'].detach().cpu().numpy())
-            
             forces = np.split(results['forces'].detach().cpu().numpy(), indices_or_sections=batch.ptr[1:], axis=0)
             forces_collection.append(forces[:-1])  # drop last as its empty
+            
+            if 'partial_charges' in results:
+                partial_charges = np.split(results['partial_charges'].detach().cpu().numpy(), indices_or_sections=batch.ptr[1:], axis=0)
+                partial_charges_collection.append(partial_charges[:-1])
+                
+            if 'dipole_moment' in results:
+                dipole_moments_list.append(results['dipole_moment'].detach().cpu().numpy())
+                
+            if 'quadrupole_moment' in results:
+                quadrupole_moments_list.append(results['quadrupole_moment'].detach().cpu().numpy())
 
         energies = np.concatenate(energies_list, axis=0)
         forces_list = [forces for forces_list in forces_collection for forces in forces_list]
         
+        if partial_charges_collection:
+            partial_charges_list = [partial_charges for partial_charges_list in partial_charges_collection for partial_charges in partial_charges_list]
+            
+        if dipole_moments_list:
+            dipole_moments = np.concatenate(dipole_moments_list, axis=0)
+            
+        if quadrupole_moments_list:
+            quadrupole_moments = np.concatenate(quadrupole_moments_list, axis=0)
+        
         assert len(atoms_list) == len(energies) == len(forces_list)
+        
+        if partial_charges_collection:
+            assert len(atoms_list) == len(partial_charges_list)
+        
+        if dipole_moments_list:
+            assert len(atoms_list) == len(dipole_moments)
+            
+        if quadrupole_moments_list:
+            assert len(atoms_list) == len(quadrupole_moments)
 
-        # Store data in atoms objects
+        # store data in atoms objects
         for i, (atoms, energy, forces) in enumerate(zip(atoms_list, energies, forces_list)):
             atoms.calc = None  # crucial
             atoms.info['ICTP_energy'] = energy
             atoms.arrays['ICTP_forces'] = forces
+            
+            if partial_charges_collection:
+                atoms.arrays['ICTP_partial_charges'] = partial_charges_list[i]
+            
+            if dipole_moments_list:
+                atoms.info['ICTP_dipole_moment'] = dipole_moments[i]
+                
+            if quadrupole_moments_list:
+                atoms.info['ICTP_quadrupole_moment'] = quadrupole_moments[i]
 
-        # Write atoms to output path
+        # write atoms to output path
         ase.io.write(folder / file_name, images=atoms_list, format="extxyz")
     
-    def measure_inference_time(self,
-                               model: ForwardAtomisticNetwork,
-                               test_structures: AtomicStructures,
-                               folder: Union[str, Path],
-                               batch_size: int = 100,
-                               n_reps: int = 100) -> Dict[str, Any]:
-        """Provide inference time for the defined batch size, i.e., atomic system size.
+    def measure_inference_time(
+        self,
+        model: ForwardAtomisticNetwork,
+        test_dataset: Dataset,
+        folder: Union[str, Path],
+        batch_size: int = 100,
+        n_reps: int = 100,
+        with_torch_script: bool = False,
+        with_torch_compile: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Provide inference time for the defined batch size, i.e., atomic system size.
 
         Args:
             models (ForwardAtomisticNetwork): Atomistic model.
-            test_structures (AtomicStructures): Test structures
+            test_dataset (Dataset): Test data set.
             folder (Union[str, Path]): Folder where the results of the inference time measurement are stored.
             batch_size (int, optional): Evaluation batch size. Defaults to 100.
             n_reps (int, optional): Number of repetitions. Defaults to 100.
+            with_torch_script (bool, optional): If True, the model is compiled using torch.jit.script().
+                                                Defaults to False.
+            with_torch_compile (bool, optional): If True, the model is compiled using torch.compile().
+                                                 Defaults to False.
 
         Returns:
             Dict[str, Any]: Results dictionary.
         """
         folder = Path(folder)
         
-        calc = StructurePropertyCalculator(model, training=False).to(self.config['device'])
+        calc = StructurePropertyCalculator(
+            model=model,
+            with_torch_script=with_torch_script,
+            with_torch_compile=with_torch_compile
+        ).to(self.config['device'])
         
-        atomic_type_converter = AtomicTypeConverter.from_type_list(self.config['atomic_types'])
-        
-        test_structures = test_structures.to_type_names(atomic_type_converter, check=True)
-        
-        test_ds = test_structures.to_data(r_cutoff=self.config['r_cutoff'], n_species=atomic_type_converter.get_n_type_names())
-        test_dl = DataLoader(test_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+        test_dl = DataLoader(
+            dataset=test_dataset,
+            batch_size=batch_size,
+            num_workers=0,
+            shuffle=False,
+            drop_last=False
+        )
         
         batch = next(iter(test_dl)).to(self.config['device'])
         
@@ -431,10 +543,12 @@ class EvaluationStrategy:
             
         end_time = time.time()
         
-        to_save = {'total_time': end_time - start_time,
-                   'time_per_repetition': (end_time - start_time) / n_reps,
-                   'time_per_structure': (end_time - start_time) / n_reps / batch_size,
-                   'time_per_atom': (end_time - start_time) / n_reps / batch.n_atoms.sum().item()}
+        to_save = {
+            'total_time': end_time - start_time,
+            'time_per_repetition': (end_time - start_time) / n_reps,
+            'time_per_structure': (end_time - start_time) / n_reps / batch_size,
+            'time_per_atom': (end_time - start_time) / n_reps / batch.n_atoms.sum().item()
+        }
         save_object(folder / f'timing_results.json', to_save, use_json=True)
         
         return to_save

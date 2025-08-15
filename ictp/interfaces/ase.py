@@ -11,7 +11,7 @@
             Nicolas Weber (nicolas.weber@neclab.eu)
             Mathias Niepert (mathias.niepert@ki.uni-stuttgart.de)
 
-NEC Laboratories Europe GmbH, Copyright (c) 2024, All rights reserved.  
+NEC Laboratories Europe GmbH, Copyright (c) 2025, All rights reserved.  
 
        THIS HEADER MAY NOT BE EXTRACTED OR MODIFIED IN ANY WAY.
  
@@ -151,48 +151,71 @@ arrangements between the parties relating hereto.
        THIS HEADER MAY NOT BE EXTRACTED OR MODIFIED IN ANY WAY.
 """
 from pathlib import Path
-from typing import List, Optional, Union, Any
+from typing import *
+
+import copy
+
+import numpy as np
+
+import torch.nn as nn
 
 import ase
 from ase.calculators.calculator import Calculator, all_changes
 from ase.stress import full_3x3_to_voigt_6_stress
 
+from ictp.data.data import (AtomicTypeConverter, 
+                            AtomicStructure, 
+                            AtomicData)
 
-from ictp.data.data import AtomicTypeConverter, AtomicStructure, AtomicData
 from ictp.model.forward import ForwardAtomisticNetwork, find_last_ckpt
-from ictp.model.calculators import TorchCalculator, StructurePropertyCalculator
+from ictp.model.pair_potentials import (CoulombElectrostaticEnergy, 
+                                        EwaldElectrostaticEnergy, 
+                                        SPMEElectrostaticEnergy)
+from ictp.model.calculators import (TorchCalculator, 
+                                    StructurePropertyCalculator)
+
 from ictp.utils.torch_geometric import DataLoader
-from ictp.utils.misc import get_default_device
+from ictp.utils.misc import get_default_device, find_max_r_cutoff
 
 
 class ASEWrapper(Calculator):
-    """Wraps a `TorchCalculator` object into an ASE calculator. It is used to perform atomistic simulations within ASE.
+    """
+    Wraps a `TorchCalculator` object into an ASE calculator. It is used to perform atomistic 
+    simulations within ASE.
 
     Args:
-        calc (TorchCalculator): The `TorchCalculator` object which allows for energy, forces, etc. calculations.
+        calc (TorchCalculator): 
+            The `TorchCalculator` object which allows for energy, forces, etc. calculations.
         r_cutoff (float): Cutoff radius for computing the neighbor list.
-        atomic_types (Optional[List[str]], optional): List of supported atomic numbers. Defaults to None.
-        device (Optional[str], optional): Available device (e.g., 'cuda:0' or 'cpu'). Defaults to None.
-        skin (float, optional): Skin distance used to update the neighbor list. Defaults to 0.0.
+        atomic_types (Optional[List[str]], optional): 
+            List of supported atomic numbers. Defaults to None.
+        device (Optional[str], optional): 
+            Available device (e.g., 'cuda:0' or 'cpu'). Defaults to None.
+        skin (float, optional): 
+            Skin distance used to update the neighbor list. Defaults to 0.0.
         wrap (bool, optional): Wrap positions back to the periodic cell. Defaults to False.
-        neighbors (str, optional): Method for computing the neighbor list. Defaults to 'matscipy'.
+        neighbors (str, optional): 
+            Method for computing the neighbor list. Defaults to 'matscipy'.
         energy_units_to_eV (float, optional): Energy conversion factor. Defaults to 1.0.
         length_units_to_A (float, optional): Length conversion factor. Defaults to 1.0.
     """
     
     implemented_properties = ['energy', 'forces', 'stress']
     
-    def __init__(self,
-                 calc: TorchCalculator,
-                 r_cutoff: float,
-                 atomic_types: Optional[List[str]] = None,
-                 device: Optional[str] = None,
-                 skin: float = 0.0,
-                 wrap: bool = False,
-                 neighbors: str = 'matscipy',
-                 energy_units_to_eV: float = 1.0,
-                 length_units_to_A: float = 1.0,
-                 **kwargs: Any):
+    def __init__(
+        self,
+        calc: TorchCalculator,
+        r_cutoff: Optional[float],
+        atomic_types: Optional[List[str]] = None,
+        device: Optional[str] = None,
+        skin: float = 0.0,
+        wrap: bool = False,
+        neighbors: str = 'matscipy',
+        energy_units_to_eV: float = 1.0,
+        length_units_to_A: float = 1.0,
+        total_charge: int = 0.0,
+        **kwargs: Any
+    ):
         super().__init__()
         self.results = {}
         
@@ -213,40 +236,82 @@ class ASEWrapper(Calculator):
         # re-scale energy and forces
         self.energy_units_to_eV = energy_units_to_eV
         self.length_units_to_A = length_units_to_A
+        # define total charge of the simulated system
+        self.total_charge = total_charge
         # init last structure to check whether new neighbors have to be computed
         self._last_structure = None
 
         # storing calc results for external use
         self._torch_calc_results = {}
 
-    def calculate(self,
-                  atoms: Optional[ase.Atoms] = None,
-                  properties: List[str] = ['energy'],
-                  system_changes: List[str] = all_changes):
-        """Calculates the total energy, atomic force, etc. for `ase.Atoms`.
+    def calculate(
+        self,
+        atoms: Optional[ase.Atoms] = None,
+        properties: List[str] = ['energy'],
+        system_changes: List[str] = all_changes
+    ):
+        """
+        Calculates the total energy, atomic force, etc. for `ase.Atoms`.
 
         Args:
-            atoms (Optional[ase.Atoms], optional): The `ase.Atoms` object. Defaults to None.
-            properties (List[str], optional): List of properties to be computed. Defaults to ['energy'].
+            atoms (Optional[ase.Atoms], optional): 
+                The `ase.Atoms` object. Defaults to None.
+            properties (List[str], optional): 
+                List of properties to be computed. Defaults to ['energy'].
             system_changes (List[str], optional): Defaults to all_changes.
         """
         if self.calculation_required(atoms, properties):
             super().calculate(atoms)
             # prepare data
-            structure = AtomicStructure.from_atoms(atoms, wrap=self.wrap, neighbors=self.neighbors)
+            structure = AtomicStructure(
+                species=atoms.get_atomic_numbers(),
+                atomic_numbers=atoms.get_atomic_numbers(),
+                positions=atoms.get_positions(),
+                cell=np.asarray(atoms.get_cell()),
+                pbc=atoms.get_pbc(),
+                total_charge=self.total_charge,
+                neighbors=self.neighbors
+            )
             # check whether provided atom types are supported
             structure = structure.to_type_names(self.atomic_type_converter, check=True)
+            # wrap atomic positions if requested
+            if self.wrap:
+                structure = structure.wrap()
             # check if neighbors can be restored from the last structure
-            if not structure.restore_neighbors_from_last(structure=self._last_structure,
-                                                         r_cutoff=self.r_cutoff, skin=self.skin):
-                self._last_structure = structure
+            if self.r_cutoff is None:
+                # if the cutoff radius is None, it is sufficient to compute the neighbor list once
+                if self._last_structure is None:
+                    self._last_structure = structure
+                structure._edge_index = self._last_structure._edge_index
+                structure._shifts = self._last_structure._shifts
+            else:
+                if not structure.restore_neighbors_from_last(
+                    structure=self._last_structure,
+                    r_cutoff=self.r_cutoff,
+                    skin=self.skin
+                ):
+                    self._last_structure = structure
             # prepare data
-            dl = DataLoader([AtomicData(structure, r_cutoff=self.r_cutoff, skin=self.skin, 
-                                        n_species=self.atomic_type_converter.get_n_type_names())],
-                            batch_size=1, shuffle=False, drop_last=False)
+            dl = DataLoader(
+                dataset=[
+                    AtomicData(
+                        structure=structure,
+                        r_cutoff=self.r_cutoff,
+                        skin=self.skin, 
+                        n_species=self.atomic_type_converter.get_n_type_names()
+                    )
+                ],
+                batch_size=1,
+                shuffle=False,
+                drop_last=False
+            )
             batch = next(iter(dl)).to(self.device)
             # predict
-            out = self.calc(batch, forces='forces' in properties, stress='stress' in properties, create_graph='stress' in properties)
+            out = self.calc(
+                graph=batch, 
+                forces='forces' in properties, 
+                stress='stress' in properties
+            )
             # store results for ase
             self.results = {'energy': out['energy'].detach().cpu().item() * self.energy_units_to_eV}
             if 'forces' in out:
@@ -259,20 +324,96 @@ class ASEWrapper(Calculator):
                 self.results['stress'] = stress_voigt
     
     @staticmethod
-    def from_folder_list(folder: Union[Path, str],
-                         **kwargs: Any) -> Calculator:
-        """Provides a wrapped ASE calculator from the model.
+    def from_folder_list(
+        folder: Union[Path, str],
+        new_pair_potential_config: Optional[Dict[str, Any]] = None,
+        with_torch_script: bool = False,
+        with_torch_compile: bool = False,
+        **kwargs: Any
+    ) -> Calculator:
+        """
+        Provides a wrapped ASE calculator from the model.
 
         Args:
             folder (Union[Path, str]): Folder containing the trained model.
+            new_pair_potential_config (Optional[Dict[str, Any]]): 
+                Configuration dictionary for constructing a new pair potential module. 
+                The config should include the type of the pair potential, the method name
+                and its initialization parameters according to `utils/config.py`. 
+                Supported types: Only "electrostatics" can be updated via this method because 
+                other pair potentials are optimized during training. This option is specifically 
+                designed to facilitate the exchange between no-cutoff electrostatics for molecular 
+                fragments and Ewald summation/SPME methods for periodic systems.
+            with_torch_script (bool, optional): If True, the model is compiled using torch.jit.script().
+                                                Defaults to False.
+            with_torch_compile (bool, optional): If True, the model is compiled using torch.compile().
+                                                 Defaults to False.
 
         Returns:
             ase.Calculator: Wrapped ASE calculator.
         """
         # load model from folder
         model = ForwardAtomisticNetwork.from_folder(find_last_ckpt(folder))
+        config = copy.deepcopy(model.config)
+        
+        if new_pair_potential_config is not None:
+            for pair_potential, params in new_pair_potential_config.items():
+                if pair_potential not in config:
+                    raise ValueError(
+                        f"Unknown pair potential type: {pair_potential=}"
+                    )
+                
+                if pair_potential != "electrostatics":
+                    raise ValueError(
+                        f"Unsupported pair potential type: {pair_potential=}. "
+                        f"This method only supports exchanging 'electrostatics' modules. "
+                        f"Trainable modules like 'repulsion' or 'dispersion' must be handled explicitly."
+                    )
+                config[pair_potential].update(params)
+        
+            new_pair_potential: Optional[nn.Module] = None
+            
+            if config['electrostatics']['method'] is not None:
+                if config['electrostatics']['method'] == 'coulomb':
+                    new_pair_potential = CoulombElectrostaticEnergy(
+                        r_cutoff=config['electrostatics']['r_cutoff'],
+                        ke=config['ke'],
+                        exclusion_radius=config['exclusion_radius'],
+                        n_exclusion_polynomial_cutoff=config['n_exclusion_polynomial_cutoff']
+                    )
+                elif config['electrostatics']['method'] == 'ewald':
+                    new_pair_potential = EwaldElectrostaticEnergy(
+                        r_cutoff=config['electrostatics']['r_cutoff'],
+                        ke=config['ke'],
+                        alpha=config['electrostatics']['alpha'],
+                        k_max=config['electrostatics']['k_max'],
+                        exclusion_radius=config['exclusion_radius'],
+                        n_exclusion_polynomial_cutoff=config['n_exclusion_polynomial_cutoff']
+                    )
+                elif config['electrostatics']['method'] == 'spme':
+                    new_pair_potential = SPMEElectrostaticEnergy(
+                        r_cutoff=config['electrostatics']['r_cutoff'],
+                        ke=config['ke'],
+                        alpha=config['electrostatics']['alpha'],
+                        k_max=config['electrostatics']['k_max'],
+                        spline_order=config['electrostatics']['spline_order'],
+                        exclusion_radius=config['exclusion_radius'],
+                        n_exclusion_polynomial_cutoff=config['n_exclusion_polynomial_cutoff']
+                    )
+                else:
+                    valid_values = ['coulomb', 'ewald', 'spme']
+                    raise ValueError(
+                        f"Invalid value for {config['electrostatics']['method']=}. "
+                        f"Expected one of {valid_values}."
+                    )
+            
+            model = model.replace_pair_potential(new_pair_potential)
         
         # build torch calculator
-        calc = StructurePropertyCalculator(model, training=False)
+        calc = StructurePropertyCalculator(
+            model=model,
+            with_torch_script=with_torch_script,
+            with_torch_compile=with_torch_compile
+        )
         
-        return ASEWrapper(calc, model.config['r_cutoff'], model.config['atomic_types'], **kwargs)
+        return ASEWrapper(calc, find_max_r_cutoff(config), config['atomic_types'], **kwargs)

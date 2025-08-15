@@ -1,3 +1,8 @@
+import sys
+
+# set python paths
+sys.path.append('/mnt/local/vzaverkin/projects/ictp')
+
 import torch
 
 from ictp.nn.radial import BesselRBF, PolynomialCutoff

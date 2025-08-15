@@ -11,7 +11,7 @@
             Nicolas Weber (nicolas.weber@neclab.eu)
             Mathias Niepert (mathias.niepert@ki.uni-stuttgart.de)
 
-NEC Laboratories Europe GmbH, Copyright (c) 2024, All rights reserved.  
+NEC Laboratories Europe GmbH, Copyright (c) 2025, All rights reserved.  
 
        THIS HEADER MAY NOT BE EXTRACTED OR MODIFIED IN ANY WAY.
  
@@ -157,16 +157,18 @@ import torch.nn as nn
 
 from ictp.o3.linear_transform import LinearTransform
 from ictp.o3.cartesian_harmonics import CartesianHarmonics
-from ictp.nn.layers import RadialEmbeddingLayer, RealAgnosticResidualInteractionLayer, ProductBasisLayer
+from ictp.nn.layers import (ChargeEmbeddingLayer, RadialEmbeddingLayer, 
+                            RealAgnosticResidualInteractionLayer, ProductBasisLayer)
 
 
 class CartesianMACE(nn.Module):
-    """MACE-like (semi-)local atomic representation using irreducible Cartesian tensors.
+    """
+    MACE-like (semi-)local atomic representation using irreducible Cartesian tensors.
 
     Args:
         r_cutoff (float): Cutoff radius.
         n_basis (int): Number of radial basis functions.
-        n_polynomial_cutoff (int): Polynomial order for the cutoff function. 
+        n_polynomial_cutoff (int): Polynomial order for the cutoff function.
         n_species (int): Number of atomic species.
         n_hidden_feats (int): Number of hidden features.
         n_product_feats (int): Number of product basis features.
@@ -179,29 +181,51 @@ class CartesianMACE(nn.Module):
         correlation (int): Correlation order, i.e., number of contracted Cartesian tensors.
         n_interactions (int): Number of interaction layers.
         radial_MLP (List[int]): List of hidden features for the radial embedding network.
+        use_charge_embedding (bool): Whether to use charge embeddings.
     """
-    def __init__(self,
-                 r_cutoff: float,
-                 n_basis: int,
-                 n_polynomial_cutoff: int,
-                 n_species: int,
-                 n_hidden_feats: int,
-                 n_product_feats: int,
-                 coupled_product_feats: bool,
-                 symmetric_product: bool,
-                 l_max_hidden_feats: int,
-                 l_max_edge_attrs: int,
-                 avg_n_neighbors: float,
-                 correlation: int,
-                 n_interactions: int,
-                 radial_MLP: List[int],
-                 **config: Any):
+    def __init__(
+        self,
+        r_cutoff: float,
+        n_basis: int,
+        n_polynomial_cutoff: int,
+        n_species: int,
+        n_hidden_feats: int,
+        n_product_feats: int,
+        coupled_product_feats: bool,
+        symmetric_product: bool,
+        l_max_hidden_feats: int,
+        l_max_edge_attrs: int,
+        avg_n_neighbors: float,
+        correlation: int,
+        n_interactions: int,
+        radial_MLP: List[int],
+        use_charge_embedding: bool,
+        **config: Any
+    ):
         super(CartesianMACE, self).__init__()
+        self.r_cutoff = r_cutoff
         self.n_hidden_feats = n_hidden_feats
         
-        self.node_embedding = LinearTransform(in_l_max=0, out_l_max=0, in_features=n_species, out_features=n_hidden_feats)
+        self.node_embedding = LinearTransform(
+            in_l_max=0,
+            out_l_max=0,
+            in_features=n_species,
+            out_features=n_hidden_feats
+        )
         
-        self.radial_embedding = RadialEmbeddingLayer(r_cutoff=r_cutoff, n_basis=n_basis, n_polynomial_cutoff=n_polynomial_cutoff)
+        self.use_charge_embedding = use_charge_embedding
+        if self.use_charge_embedding:
+            self.charge_embedding = ChargeEmbeddingLayer(
+                in_features=n_hidden_feats,
+                out_features=n_hidden_feats,
+                charge_MLP=[n_hidden_feats],
+            )
+        
+        self.radial_embedding = RadialEmbeddingLayer(
+            r_cutoff=r_cutoff,
+            n_basis=n_basis,
+            n_polynomial_cutoff=n_polynomial_cutoff
+        )
         
         self.cartesian_harmonics = CartesianHarmonics(l_max_edge_attrs)
         
@@ -210,15 +234,32 @@ class CartesianMACE(nn.Module):
         else:
             l_max_out_feats = l_max_hidden_feats
         
-        inter = RealAgnosticResidualInteractionLayer(l_max_node_feats=0, l_max_edge_attrs=l_max_edge_attrs, l_max_target_feats=l_max_edge_attrs, 
-                                                     l_max_hidden_feats=l_max_out_feats, n_basis=n_basis, n_species=n_species, in_features=n_hidden_feats, 
-                                                     out_features=n_product_feats, avg_n_neighbors=avg_n_neighbors, radial_MLP=radial_MLP)
+        inter = RealAgnosticResidualInteractionLayer(
+            l_max_node_feats=0,
+            l_max_edge_attrs=l_max_edge_attrs,
+            l_max_target_feats=l_max_edge_attrs, 
+            l_max_hidden_feats=l_max_out_feats,
+            n_basis=n_basis,
+            n_species=n_species,
+            in_features=n_hidden_feats, 
+            out_features=n_product_feats,
+            avg_n_neighbors=avg_n_neighbors,
+            radial_MLP=radial_MLP,
+        )
         
         self.interactions = torch.nn.ModuleList([inter])
         
-        prod = ProductBasisLayer(l_max_node_feats=l_max_edge_attrs, l_max_target_feats=l_max_out_feats, in_features=n_product_feats, 
-                                 out_features=n_hidden_feats, n_species=n_species, correlation=correlation, coupled_feats=coupled_product_feats, 
-                                 symmetric_product=symmetric_product, use_sc=True)
+        prod = ProductBasisLayer(
+            l_max_node_feats=l_max_edge_attrs,
+            l_max_target_feats=l_max_out_feats,
+            in_features=n_product_feats, 
+            out_features=n_hidden_feats,
+            n_species=n_species,
+            correlation=correlation,
+            coupled_feats=coupled_product_feats, 
+            symmetric_product=symmetric_product,
+            use_sc=True,
+        )
         
         self.products = torch.nn.ModuleList([prod])
         
@@ -227,18 +268,36 @@ class CartesianMACE(nn.Module):
                 l_max_out_feats = 0
             else:
                 l_max_out_feats = l_max_hidden_feats
-            inter = RealAgnosticResidualInteractionLayer(l_max_node_feats=l_max_hidden_feats, l_max_edge_attrs=l_max_edge_attrs, l_max_target_feats=l_max_edge_attrs, 
-                                                         l_max_hidden_feats=l_max_out_feats, n_basis=n_basis, n_species=n_species, in_features=n_hidden_feats, 
-                                                         out_features=n_product_feats, avg_n_neighbors=avg_n_neighbors, radial_MLP=radial_MLP)
+            inter = RealAgnosticResidualInteractionLayer(
+                l_max_node_feats=l_max_hidden_feats,
+                l_max_edge_attrs=l_max_edge_attrs,
+                l_max_target_feats=l_max_edge_attrs,
+                l_max_hidden_feats=l_max_out_feats,
+                n_basis=n_basis,
+                n_species=n_species,
+                in_features=n_hidden_feats,
+                out_features=n_product_feats,
+                avg_n_neighbors=avg_n_neighbors,
+                radial_MLP=radial_MLP,
+            )
             self.interactions.append(inter)
             
-            prod = ProductBasisLayer(l_max_node_feats=l_max_edge_attrs, l_max_target_feats=l_max_out_feats, in_features=n_product_feats, 
-                                     out_features=n_hidden_feats, n_species=n_species, correlation=correlation, coupled_feats=coupled_product_feats,
-                                     symmetric_product=symmetric_product, use_sc=True)
+            prod = ProductBasisLayer(
+                l_max_node_feats=l_max_edge_attrs,
+                l_max_target_feats=l_max_out_feats,
+                in_features=n_product_feats,
+                out_features=n_hidden_feats,
+                n_species=n_species,
+                correlation=correlation,
+                coupled_feats=coupled_product_feats,
+                symmetric_product=symmetric_product,
+                use_sc=True,
+            )
             self.products.append(prod)
                 
     def forward(self, graph: Dict[str, torch.Tensor]) -> List[torch.Tensor]:
-        """Computes node features.
+        """
+        Computes node features.
 
         Args:
             graph (Dict[str, torch.Tensor]): Atomic graph dictionary.
@@ -246,23 +305,44 @@ class CartesianMACE(nn.Module):
         Returns:
             torch.Tensor: Node features.
         """
-        edge_index, positions, node_attrs, shifts = graph['edge_index'], graph['positions'], graph['node_attrs'], graph['shifts']
-        
+        node_attrs, edge_index, vectors, lengths = (
+            graph['node_attrs'],
+            graph['edge_index'],
+            graph['vectors'],
+            graph['lengths']
+        )
         idx_i, idx_j = edge_index[0, :], edge_index[1, :]
-        vectors = positions.index_select(0, idx_i) - positions.index_select(0, idx_j) - shifts
-        lengths = torch.norm(vectors, dim=-1, keepdim=True)
+        
+        # short-range atom pairs
+        cutoff_mask = lengths.squeeze() <= self.r_cutoff
+        lengths = lengths[cutoff_mask]
+        vectors = vectors[cutoff_mask]
+        idx_i = idx_i[cutoff_mask]
+        idx_j = idx_j[cutoff_mask]
         
         node_feats = self.node_embedding(node_attrs)
+        if self.use_charge_embedding:
+            # TODO: because of a bug related to torch.compile this should be executed if batch size is 1 and model is torch-compiled. for neutral molecules with total_charge = 0.0 we can simply skip this step, while for a charged molecule an error should be raised. if model is executed in an eager mode -> no problem.
+            node_feats = node_feats + self.charge_embedding(node_feats=node_feats, graph=graph)
         edge_feats = self.radial_embedding(lengths)
         edge_attrs = self.cartesian_harmonics(vectors)  # vectors are normalized when computing Cartesian harmonics
 
         node_feats_list = []
         for interaction, product in zip(self.interactions, self.products):
-            node_feats, sc = interaction(node_attrs=node_attrs, node_feats=node_feats,
-                                         edge_attrs=edge_attrs, edge_feats=edge_feats,
-                                         idx_i=idx_i, idx_j=idx_j)
+            node_feats, sc = interaction(
+                node_attrs=node_attrs,
+                node_feats=node_feats,
+                edge_attrs=edge_attrs,
+                edge_feats=edge_feats,
+                idx_i=idx_i,
+                idx_j=idx_j,
+            )
             
-            node_feats = product(node_feats=node_feats, sc=sc, node_attrs=node_attrs)
+            node_feats = product(
+                node_feats=node_feats,
+                sc=sc,
+                node_attrs=node_attrs,
+            )
             
             node_feats_list.append(node_feats[:, :self.n_hidden_feats])
 

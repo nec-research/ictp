@@ -11,7 +11,7 @@
             Nicolas Weber (nicolas.weber@neclab.eu)
             Mathias Niepert (mathias.niepert@ki.uni-stuttgart.de)
 
-NEC Laboratories Europe GmbH, Copyright (c) 2024, All rights reserved.  
+NEC Laboratories Europe GmbH, Copyright (c) 2025, All rights reserved.  
 
        THIS HEADER MAY NOT BE EXTRACTED OR MODIFIED IN ANY WAY.
  
@@ -153,20 +153,26 @@ arrangements between the parties relating hereto.
 import numpy as np
 from typing import *
 
+import torch
+
 from ase import Atoms
 
 from matscipy.neighbours import neighbour_list
+from vesin import ase_neighbor_list
 
 
-def get_matscipy_neighbors(positions: np.ndarray,
-                           cell: np.ndarray,
-                           pbc: Union[List[bool], bool],
-                           r_cutoff: float,
-                           skin: float = 0.0,
-                           eps: float = 1e-8,
-                           buffer: float = 1.0,
-                           **config: Any) -> Tuple[np.ndarray, np.ndarray]:
-    """Computes neighbor lists using 'matscipy'.
+def get_matscipy_neighbors(
+    positions: np.ndarray,
+    cell: np.ndarray,
+    pbc: Union[List[bool], bool],
+    r_cutoff: float,
+    skin: float = 0.0,
+    eps: float = 1e-8,
+    buffer: float = 1.0,
+    **config: Any
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Computes neighbor lists using 'matscipy'.
 
     Args:
         positions (np.ndarray): Atom positions.
@@ -194,5 +200,61 @@ def get_matscipy_neighbors(positions: np.ndarray,
     idx_i, idx_j, S = neighbour_list("ijS", atoms, r_cutoff + skin)
     edge_idx = np.stack([idx_i, idx_j])
     offset = S @ cell
+
+    return edge_idx, offset
+
+
+def get_vesin_neighbors(
+    positions: np.ndarray,
+    cell: np.ndarray,
+    pbc: Union[List[bool], bool],
+    r_cutoff: float,
+    skin: float = 0.0,
+    eps: float = 1e-8,
+    buffer: float = 1.0,
+    **config: Any
+) -> Tuple[np.ndarray, np.ndarray]:
+    atoms = Atoms(positions=positions, cell=cell, pbc=pbc)
+    
+    # Add cell if none is present (volume = 0)
+    if atoms.cell.volume < eps:
+        # max values - min values along xyz augmented by small buffer for stability
+        new_cell = np.ptp(atoms.positions, axis=0) + buffer
+        # Set cell and center
+        atoms.set_cell(new_cell, scale_atoms=False)
+        atoms.center()
+
+    # Compute neighborhood
+    idx_i, idx_j, S = ase_neighbor_list("ijS", atoms, r_cutoff + skin)
+    edge_idx = np.stack([idx_i, idx_j])
+    offset = S @ cell
+
+    return edge_idx, offset
+
+
+def primitive_pairs(positions: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Computes primitive neighbor pairs.
+
+    Args:
+        positions (np.ndarray): Atomic positions.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: Neighbors (edge indices) and shift vectors (the number of cell boundaries crossed by the bond between atoms).
+    """
+    n_atoms = positions.shape[0]
+
+    idx_i_uni, idx_j_uni = np.triu_indices(n_atoms, 1)
+
+    idx_i_bi = np.concatenate([idx_i_uni, idx_j_uni])
+    idx_j_bi = np.concatenate([idx_j_uni, idx_i_uni])
+
+    sort_idx = np.argsort(idx_i_bi)
+    idx_i_bi = idx_i_bi[sort_idx]
+    idx_j_bi = idx_j_bi[sort_idx]
+    
+    offset = np.zeros((idx_i_bi.shape[0], 3), dtype=np.float64)
+
+    edge_idx = np.stack([idx_i_bi, idx_j_bi], axis=0)
 
     return edge_idx, offset

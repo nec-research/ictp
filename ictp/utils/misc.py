@@ -11,7 +11,7 @@
             Nicolas Weber (nicolas.weber@neclab.eu)
             Mathias Niepert (mathias.niepert@ki.uni-stuttgart.de)
 
-NEC Laboratories Europe GmbH, Copyright (c) 2024, All rights reserved.  
+NEC Laboratories Europe GmbH, Copyright (c) 2025, All rights reserved.  
 
        THIS HEADER MAY NOT BE EXTRACTED OR MODIFIED IN ANY WAY.
  
@@ -153,7 +153,7 @@ arrangements between the parties relating hereto.
 import json
 import pickle
 from pathlib import Path
-from typing import List, Union, Any, Dict
+from typing import List, Union, Any, Optional, Callable, Dict
 
 import torch
 import torch.nn as nn
@@ -231,3 +231,49 @@ def recursive_detach(inputs: Any) -> Any:
 
 def count_parameters(module: nn.Module) -> int:
     return int(sum(np.prod(p.shape) for p in module.parameters()))
+    
+
+def to_tensor(value: Optional[Any], 
+              dtype: Optional[torch.dtype] = None, 
+              default: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
+    """Convert a value to a PyTorch tensor, with an optional default if the value is None.
+    
+    Args:
+        value (Optional[Any]): The input value to convert to a tensor. Can be None.
+        dtype (Optional[torch.dtype]): The desired data type for the tensor. Defaults to None.
+        default (Optional[torch.Tensor]): The value to return if `value` is None. Defaults to None.
+
+    Returns:
+        Optional[torch.Tensor]: A tensor if `value` is not None; otherwise, `default`.
+    """
+    if value is None:
+        return default
+    tensor = torch.tensor(value, dtype=dtype or torch.get_default_dtype())
+    return tensor
+
+
+def find_max_r_cutoff(config: Dict[str, Any]) -> Optional[float]:
+    """Determines the maximum cutoff distance (`r_cutoff`) from the provided configuration.
+    
+    The `r_cutoff` values correspond those from the message-passing/representation configuration and 
+    from specific pair potentials such as 'repulsion', 'electrostatics', and 'dispersion'. 
+    
+    Note: If any `r_cutoff` value is set to `None` (indicating no cutoff is applied for a particular 
+    interaction), the function will treat `None` as the maximum value.
+
+    Args:
+        config (Dict[str, Any]): Configuration file with parameters.
+
+    Returns:
+        Optional[float]: The maximum `r_cutoff` value.
+    """
+    r_cutoffs = [config['r_cutoff']]
+    
+    for pair_potential in ['repulsion', 'electrostatics', 'dispersion']:
+        if config[pair_potential]['method'] is not None:
+            r_cutoffs.append(config[pair_potential]['r_cutoff'])
+    
+    if None in r_cutoffs:
+        return None
+    
+    return max(r_cutoffs)

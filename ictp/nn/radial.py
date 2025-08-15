@@ -11,7 +11,7 @@
             Nicolas Weber (nicolas.weber@neclab.eu)
             Mathias Niepert (mathias.niepert@ki.uni-stuttgart.de)
 
-NEC Laboratories Europe GmbH, Copyright (c) 2024, All rights reserved.  
+NEC Laboratories Europe GmbH, Copyright (c) 2025, All rights reserved.  
 
        THIS HEADER MAY NOT BE EXTRACTED OR MODIFIED IN ANY WAY.
  
@@ -157,7 +157,8 @@ import torch.nn as nn
 
 
 class BesselRBF(nn.Module):
-    """Computes the Bessel radial basis function.
+    """
+    Computes the Bessel radial basis function.
     
     Klicpera, J.; Groß, J.; Günnemann, S. Directional Message Passing for Molecular Graphs; ICLR 2020.
     Equation (7)
@@ -168,9 +169,11 @@ class BesselRBF(nn.Module):
         r_cutoff (float): Cutoff radius.
         n_basis (int, optional): Number of basis functions. Defaults to 8.
     """
-    def __init__(self, 
-                 r_cutoff: float, 
-                 n_basis: int = 8):
+    def __init__(
+        self, 
+        r_cutoff: float, 
+        n_basis: int = 8
+    ):
         super().__init__()
         bessel_weights = np.pi / r_cutoff * torch.linspace(start=1.0, end=n_basis, steps=n_basis, dtype=torch.get_default_dtype())
         
@@ -179,7 +182,8 @@ class BesselRBF(nn.Module):
         self.register_buffer('pre_factor', torch.tensor(np.sqrt(2.0 / r_cutoff), dtype=torch.get_default_dtype()))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Evaluates the Bessel radial basis on the provided input distances.
+        """
+        Evaluates the Bessel radial basis on the provided input distances.
 
         Args:
             x (torch.Tensor): Input distances.
@@ -195,7 +199,8 @@ class BesselRBF(nn.Module):
 
 
 class PolynomialCutoff(nn.Module):
-    """Computes polynomial cutoff function.
+    """
+    Computes polynomial cutoff function.
     
     Klicpera, J.; Groß, J.; Günnemann, S. Directional Message Passing for Molecular Graphs; ICLR 2020.
     Equation (8)
@@ -206,15 +211,18 @@ class PolynomialCutoff(nn.Module):
         r_cutoff (float): Cutoff radius.
         p (int, optional): Polynomial order. Defaults to 6.
     """
-    def __init__(self, 
-                 r_cutoff: float, 
-                 p: int = 6):
+    def __init__(
+        self, 
+        r_cutoff: float, 
+        p: int = 6
+    ):
         super().__init__()
-        self.register_buffer('p', torch.tensor(p, dtype=torch.get_default_dtype()))
+        self.register_buffer('p', torch.tensor(p, dtype=torch.int))
         self.register_buffer('r_cutoff', torch.tensor(r_cutoff, dtype=torch.get_default_dtype()))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Evaluates the cutoff function on the provided input distances.
+        """
+        Evaluates the cutoff function on the provided input distances.
 
         Args:
             x (torch.Tensor): Input distances.
@@ -222,13 +230,22 @@ class PolynomialCutoff(nn.Module):
         Returns:
             torch.Tensor: Values of the cutoff function.
         """
+        return self.calculate_envelope(x, self.r_cutoff, self.p)
+    
+    @staticmethod
+    def calculate_envelope(
+        x: torch.Tensor,
+        r_cutoff: torch.Tensor,
+        p: int
+    ) -> torch.Tensor:
+        x_by_r_cutoff = x / r_cutoff
         envelope = (
                 1.0
-                - ((self.p + 1.0) * (self.p + 2.0) / 2.0) * torch.pow(x / self.r_cutoff, self.p)
-                + self.p * (self.p + 2.0) * torch.pow(x / self.r_cutoff, self.p + 1)
-                - (self.p * (self.p + 1.0) / 2) * torch.pow(x / self.r_cutoff, self.p + 2)
+                - ((p + 1.0) * (p + 2.0) / 2.0) * torch.pow(x_by_r_cutoff, p)
+                + p * (p + 2.0) * torch.pow(x_by_r_cutoff, p + 1)
+                - (p * (p + 1.0) / 2) * torch.pow(x_by_r_cutoff, p + 2)
         )
-        return envelope * (x < self.r_cutoff)
+        return envelope * (x < r_cutoff)
     
     def __repr__(self):
         return f'{self.__class__.__name__}(p={self.p}, r_cutoff={self.r_cutoff})'

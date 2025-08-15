@@ -1,3 +1,9 @@
+import sys
+
+# set python paths
+sys.path.append('/mnt/local/vzaverkin/projects/ictp')
+sys.path.append('/mnt/local/vzaverkin/projects/ictp/test')
+
 import scipy
 import torch
 

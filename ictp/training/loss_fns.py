@@ -11,7 +11,7 @@
             Nicolas Weber (nicolas.weber@neclab.eu)
             Mathias Niepert (mathias.niepert@ki.uni-stuttgart.de)
 
-NEC Laboratories Europe GmbH, Copyright (c) 2024, All rights reserved.  
+NEC Laboratories Europe GmbH, Copyright (c) 2025, All rights reserved.  
 
        THIS HEADER MAY NOT BE EXTRACTED OR MODIFIED IN ANY WAY.
  
@@ -151,11 +151,13 @@ arrangements between the parties relating hereto.
        THIS HEADER MAY NOT BE EXTRACTED OR MODIFIED IN ANY WAY.
 """
 import torch
+import torch.nn.functional as F
 
 from typing import Dict, List, Any, Callable
 
 from ictp.utils.torch_geometric import Data
 from ictp.utils.misc import recursive_detach
+from ictp.utils.math import segment_sum
 
 
 class LossFunction:
@@ -219,13 +221,47 @@ class SingleLossFunction(LossFunction):
         self.output_variable = output_variable
         self.batch_loss = batch_loss
         self.overall_reduction = overall_reduction
+        
+        # counters for removed structures and atoms
+        self.n_structures_removed = 0
+        self.n_atoms_removed = 0
 
     def compute_batch_loss(self,
                            results: Dict[str, torch.Tensor],
                            batch: Data) -> torch.Tensor:
         y_pred = results[self.output_variable]
         y = getattr(batch, self.output_variable)
-        return self.batch_loss(y, y_pred, batch=batch)
+        n_atoms = batch.n_atoms
+        
+        # compute mask for non-nan values in y
+        mask = ~torch.isnan(y).any(dim=tuple(range(1, y.dim())), keepdim=False)
+        
+        # if mask is empty (all values are nan), return a dummy loss (zero loss)
+        if mask.sum().item() == 0:
+            return 0.0 * y_pred.sum()
+        
+        # if ~mask is not empty (there are nan values), apply the mask and update counters
+        if (~mask).sum().item() > 0:
+            # apply mask to n_atoms and update counters
+            if y.shape[0] == batch.n_atoms.shape[0]:
+                n_atoms = n_atoms[mask]
+                self.n_structures_removed += (~mask).sum().item()
+                self.n_atoms_removed += batch.n_atoms[~mask].sum().item()
+            elif y.shape[0] == batch.n_atoms.sum().item():
+                n_atoms = n_atoms[segment_sum(mask, batch.batch, batch.n_atoms.shape[0]) > 0]
+                self.n_structures_removed += (segment_sum(~mask, batch.batch, batch.n_atoms.shape[0]) / batch.n_atoms).sum().item()
+                self.n_atoms_removed += (~mask).sum().item()
+            else:
+                raise RuntimeError(
+                    f'Expected the first dimension of output variables to match either the number of structures '
+                    f'(n_structures x ...) or the total number of atoms (n_atoms x ...). Provided {y.shape=}.'
+                )
+            
+            # apply mask to both y and y_pred
+            y_pred = y_pred[mask]
+            y = y[mask]
+        
+        return self.batch_loss(y, y_pred, n_atoms=n_atoms)
 
     def reduce_overall(self,
                        losses: List[Any],
@@ -234,6 +270,13 @@ class SingleLossFunction(LossFunction):
         collated = torch.cat([l if len(l.shape) > 0 else l[None] for l in losses], dim=0)
         if self.overall_reduction is None:
             return collated
+        
+        n_structures_total -= self.n_structures_removed
+        n_atoms_total -= self.n_atoms_removed
+        
+        self.n_structures_removed = 0
+        self.n_atoms_removed = 0
+        
         return self.overall_reduction(collated, n_structures_total, n_atoms_total)
 
     def get_output_variables(self) -> List[str]:
@@ -336,130 +379,245 @@ def full_3x3_to_voigt_6_stress(stress_matrix: torch.Tensor) -> torch.Tensor:
                         (stress_matrix[..., 0, 1] + stress_matrix[..., 1, 0]) / 2], dim=-1)
 
 
+def full_3x3_to_5_quadrupole(quadrupole_matrix: torch.Tensor) -> torch.Tensor:
+    """Form a five-component quadrupole vector from a 3 x 3 traceless matrix.
+    
+    Args:
+        quadrupole_matrix (torch.Tensor): 3 x 3 traceless quadrupole matrix.
+        
+    Returns: 
+        torch.Tensor: A five-component quadrupole vector.
+    """
+    return torch.stack([quadrupole_matrix[..., 0, 0], 
+                        quadrupole_matrix[..., 1, 1],
+                        (quadrupole_matrix[..., 1, 2] + quadrupole_matrix[..., 2, 1]) / 2,
+                        (quadrupole_matrix[..., 0, 2] + quadrupole_matrix[..., 2, 0]) / 2, 
+                        (quadrupole_matrix[..., 0, 1] + quadrupole_matrix[..., 1, 0]) / 2], dim=-1)
+
+
+def normalized_dot_product(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """
+    Computes the dot product between two tensors after normalizing them to unit vectors.
+
+    Args:
+        x (torch.Tensor): A tensor of shape n_atoms x d representing target vectors.
+        y (torch.Tensor): A tensor of shape n_atoms x d representing input vectors.
+
+    Returns:
+        torch.Tensor: A tensor of shape n_atoms containing the normalized dot product.
+    """
+    x = F.normalize(x, p=2, dim=-1, eps=1e-7)
+    y = F.normalize(y, p=2, dim=-1, eps=1e-7)
+    return torch.sum(x * y, dim=-1)
+
+
 METRICS = dict(
+    # energy loss functions
     energy_sae=SingleLossFunction('energy',
-                                  lambda y, y_pred, batch: (y-y_pred).abs().sum(),
+                                  lambda y, y_pred, n_atoms: (y-y_pred).abs().sum(),
                                   lambda losses, n_structures, n_atoms: losses.sum()),
     energy_mae=SingleLossFunction('energy',
-                                  lambda y, y_pred, batch: (y-y_pred).abs().sum(),
+                                  lambda y, y_pred, n_atoms: (y-y_pred).abs().sum(),
                                   lambda losses, n_structures, n_atoms: losses.sum() / n_structures),
     energy_sse=SingleLossFunction('energy',
-                                  lambda y, y_pred, batch: (y-y_pred).square().sum(),
+                                  lambda y, y_pred, n_atoms: (y-y_pred).square().sum(),
                                   lambda losses, n_structures, n_atoms: losses.sum()),
     energy_mse=SingleLossFunction('energy',
-                                  lambda y, y_pred, batch: (y-y_pred).square().sum(),
+                                  lambda y, y_pred, n_atoms: (y-y_pred).square().sum(),
                                   lambda losses, n_structures, n_atoms: losses.sum() / n_structures),
     energy_rmse=SingleLossFunction('energy',
-                                   lambda y, y_pred, batch: (y - y_pred).square().sum(),
+                                   lambda y, y_pred, n_atoms: (y - y_pred).square().sum(),
                                    lambda losses, n_structures, n_atoms: (losses.sum() / n_structures).sqrt()),
     energy_l4=SingleLossFunction('energy',
-                                 lambda y, y_pred, batch: ((y-y_pred) ** 4).sum(),
+                                 lambda y, y_pred, n_atoms: ((y-y_pred) ** 4).sum(),
                                  lambda losses, n_structures, n_atoms: (losses.sum() / n_structures) ** 0.25),
     energy_maxe=SingleLossFunction('energy',
-                                   lambda y, y_pred, batch: (y - y_pred).abs().max(),
-                                   lambda losses, n_structures, n_atoms: losses.max()),
-    forces_sae=SingleLossFunction('forces',
-                                  lambda y, y_pred, batch: (y-y_pred).abs().sum(),
-                                  lambda losses, n_structures, n_atoms: losses.sum()),
-    forces_mae=SingleLossFunction('forces',
-                                  lambda y, y_pred, batch: (y-y_pred).abs().sum(),
-                                  lambda losses, n_structures, n_atoms: losses.sum() / (3*n_atoms)),
-    forces_sse=SingleLossFunction('forces',
-                                  lambda y, y_pred, batch: (y-y_pred).square().sum(),
-                                  lambda losses, n_structures, n_atoms: losses.sum()),
-    forces_mse=SingleLossFunction('forces',
-                                  lambda y, y_pred, batch: (y-y_pred).square().sum(),
-                                  lambda losses, n_structures, n_atoms: losses.sum() / (3*n_atoms)),
-    forces_rmse=SingleLossFunction('forces',
-                                   lambda y, y_pred, batch: (y-y_pred).square().sum(),
-                                   lambda losses, n_structures, n_atoms: (losses.sum() / (3*n_atoms)).sqrt()),
-    forces_l4=SingleLossFunction('forces',
-                                 lambda y, y_pred, batch: ((y-y_pred) ** 4).sum(),
-                                 lambda losses, n_structures, n_atoms: (losses.sum() / (3*n_atoms)) ** 0.25),
-    forces_maxe=SingleLossFunction('forces',
-                                   lambda y, y_pred, batch: (y - y_pred).abs().max(),
-                                   lambda losses, n_structures, n_atoms: losses.max()),
-    stress_sae=SingleLossFunction('stress',
-                                   lambda y, y_pred, batch: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).abs().sum(),
-                                   lambda losses, n_structures, n_atoms: losses.sum()),
-    stress_mae=SingleLossFunction('stress',
-                                   lambda y, y_pred, batch: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).abs().sum(),
-                                   lambda losses, n_structures, n_atoms: losses.sum() / (6*n_structures)),
-    stress_sse=SingleLossFunction('stress',
-                                   lambda y, y_pred, batch: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).square().sum(),
-                                   lambda losses, n_structures, n_atoms: losses.sum()),
-    stress_mse=SingleLossFunction('stress',
-                                  lambda y, y_pred, batch: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).square().sum(),
-                                  lambda losses, n_structures, n_atoms: losses.sum() / (6*n_structures)),
-    stress_rmse=SingleLossFunction('stress',
-                                   lambda y, y_pred, batch: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).square().sum(),
-                                   lambda losses, n_structures, n_atoms: (losses.sum() / (6*n_structures)).sqrt()),
-    stress_l4=SingleLossFunction('stress',
-                                 lambda y, y_pred, batch: ((full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)) ** 4).sum(),
-                                 lambda losses, n_structures, n_atoms: (losses.sum() / (6*n_structures)) ** 0.25),
-    stress_maxe=SingleLossFunction('stress',
-                                   lambda y, y_pred, batch: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).abs().max(),
-                                   lambda losses, n_structures, n_atoms: losses.max()),
-    virials_sae=SingleLossFunction('virials',
-                                   lambda y, y_pred, batch: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).abs().sum(),
-                                   lambda losses, n_structures, n_atoms: losses.sum()),
-    virials_mae=SingleLossFunction('virials',
-                                   lambda y, y_pred, batch: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).abs().sum(),
-                                   lambda losses, n_structures, n_atoms: losses.sum() / (6*n_structures)),
-    virials_sse=SingleLossFunction('virials',
-                                   lambda y, y_pred, batch: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).square().sum(),
-                                   lambda losses, n_structures, n_atoms: losses.sum()),
-    virials_mse=SingleLossFunction('virials',
-                                  lambda y, y_pred, batch: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).square().sum(),
-                                  lambda losses, n_structures, n_atoms: losses.sum() / (6*n_structures)),
-    virials_rmse=SingleLossFunction('virials',
-                                   lambda y, y_pred, batch: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).square().sum(),
-                                   lambda losses, n_structures, n_atoms: (losses.sum() / (6*n_structures)).sqrt()),
-    virials_l4=SingleLossFunction('virials',
-                                 lambda y, y_pred, batch: ((full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)) ** 4).sum(),
-                                 lambda losses, n_structures, n_atoms: (losses.sum() / (6 * n_structures)) ** 0.25),
-    virials_maxe=SingleLossFunction('virials',
-                                   lambda y, y_pred, batch: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).abs().max(),
+                                   lambda y, y_pred, n_atoms: (y - y_pred).abs().max(),
                                    lambda losses, n_structures, n_atoms: losses.max()),
     energy_per_atom_sae=SingleLossFunction('energy',
-                                           lambda y, y_pred, batch: ((y-y_pred)/batch.n_atoms).abs().sum(),
+                                           lambda y, y_pred, n_atoms: ((y-y_pred)/n_atoms).abs().sum(),
                                            lambda losses, n_structures, n_atoms: losses.sum()),
     energy_per_atom_mae=SingleLossFunction('energy',
-                                           lambda y, y_pred, batch: ((y-y_pred)/batch.n_atoms).abs().sum(),
+                                           lambda y, y_pred, n_atoms: ((y-y_pred)/n_atoms).abs().sum(),
                                            lambda losses, n_structures, n_atoms: losses.sum() / n_structures),
     energy_per_atom_sse=SingleLossFunction('energy',
-                                           lambda y, y_pred, batch: ((y-y_pred)/batch.n_atoms).square().sum(),
+                                           lambda y, y_pred, n_atoms: ((y-y_pred)/n_atoms).square().sum(),
                                            lambda losses, n_structures, n_atoms: losses.sum()),
     energy_per_atom_mse=SingleLossFunction('energy',
-                                           lambda y, y_pred, batch: ((y-y_pred)/batch.n_atoms).square().sum(),
+                                           lambda y, y_pred, n_atoms: ((y-y_pred)/n_atoms).square().sum(),
                                            lambda losses, n_structures, n_atoms: losses.sum() / n_structures),
     energy_per_atom_rmse=SingleLossFunction('energy',
-                                            lambda y, y_pred, batch: ((y-y_pred)/batch.n_atoms).square().sum(),
+                                            lambda y, y_pred, n_atoms: ((y-y_pred)/n_atoms).square().sum(),
                                             lambda losses, n_structures, n_atoms: (losses.sum() / n_structures).sqrt()),
     energy_per_atom_l4=SingleLossFunction('energy',
-                                          lambda y, y_pred, batch: (((y-y_pred)/batch.n_atoms) ** 4).sum(),
+                                          lambda y, y_pred, n_atoms: (((y-y_pred)/n_atoms) ** 4).sum(),
                                           lambda losses, n_structures, n_atoms: (losses.sum() / n_structures) ** 0.25),
     energy_per_atom_maxe=SingleLossFunction('energy',
-                                            lambda y, y_pred, batch: ((y-y_pred)/batch.n_atoms).abs().max(),
+                                            lambda y, y_pred, n_atoms: ((y-y_pred)/n_atoms).abs().max(),
                                             lambda losses, n_structures, n_atoms: losses.max()),
     energy_by_sqrt_atoms_sse=SingleLossFunction('energy',
-                                                lambda y, y_pred, batch: ((y-y_pred).square() / batch.n_atoms).sum(),
+                                                lambda y, y_pred, n_atoms: ((y-y_pred).square() / n_atoms).sum(),
                                                 lambda losses, n_structures, n_atoms: losses.sum()),
     energy_by_sqrt_atoms_mse=SingleLossFunction('energy',
-                                                lambda y, y_pred, batch: ((y-y_pred).square() / batch.n_atoms).sum(),
+                                                lambda y, y_pred, n_atoms: ((y-y_pred).square() / n_atoms).sum(),
                                                 lambda losses, n_structures, n_atoms: losses.sum() / n_structures),
+    # forces loss functions
+    forces_sae=SingleLossFunction('forces',
+                                  lambda y, y_pred, n_atoms: (y-y_pred).abs().sum(),
+                                  lambda losses, n_structures, n_atoms: losses.sum()),
+    forces_mae=SingleLossFunction('forces',
+                                  lambda y, y_pred, n_atoms: (y-y_pred).abs().sum(),
+                                  lambda losses, n_structures, n_atoms: losses.sum() / (3*n_atoms)),
+    forces_sse=SingleLossFunction('forces',
+                                  lambda y, y_pred, n_atoms: (y-y_pred).square().sum(),
+                                  lambda losses, n_structures, n_atoms: losses.sum()),
+    forces_mse=SingleLossFunction('forces',
+                                  lambda y, y_pred, n_atoms: (y-y_pred).square().sum(),
+                                  lambda losses, n_structures, n_atoms: losses.sum() / (3*n_atoms)),
+    forces_rmse=SingleLossFunction('forces',
+                                   lambda y, y_pred, n_atoms: (y-y_pred).square().sum(),
+                                   lambda losses, n_structures, n_atoms: (losses.sum() / (3*n_atoms)).sqrt()),
+    forces_l4=SingleLossFunction('forces',
+                                 lambda y, y_pred, n_atoms: ((y-y_pred) ** 4).sum(),
+                                 lambda losses, n_structures, n_atoms: (losses.sum() / (3*n_atoms)) ** 0.25),
+    forces_maxe=SingleLossFunction('forces',
+                                   lambda y, y_pred, n_atoms: (y - y_pred).abs().max(),
+                                   lambda losses, n_structures, n_atoms: losses.max()),
+    # stress loss functions
+    stress_sae=SingleLossFunction('stress',
+                                   lambda y, y_pred, n_atoms: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).abs().sum(),
+                                   lambda losses, n_structures, n_atoms: losses.sum()),
+    stress_mae=SingleLossFunction('stress',
+                                   lambda y, y_pred, n_atoms: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).abs().sum(),
+                                   lambda losses, n_structures, n_atoms: losses.sum() / (6*n_structures)),
+    stress_sse=SingleLossFunction('stress',
+                                   lambda y, y_pred, n_atoms: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).square().sum(),
+                                   lambda losses, n_structures, n_atoms: losses.sum()),
+    stress_mse=SingleLossFunction('stress',
+                                  lambda y, y_pred, n_atoms: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).square().sum(),
+                                  lambda losses, n_structures, n_atoms: losses.sum() / (6*n_structures)),
+    stress_rmse=SingleLossFunction('stress',
+                                   lambda y, y_pred, n_atoms: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).square().sum(),
+                                   lambda losses, n_structures, n_atoms: (losses.sum() / (6*n_structures)).sqrt()),
+    stress_l4=SingleLossFunction('stress',
+                                 lambda y, y_pred, n_atoms: ((full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)) ** 4).sum(),
+                                 lambda losses, n_structures, n_atoms: (losses.sum() / (6*n_structures)) ** 0.25),
+    stress_maxe=SingleLossFunction('stress',
+                                   lambda y, y_pred, n_atoms: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).abs().max(),
+                                   lambda losses, n_structures, n_atoms: losses.max()),
+    # virials loss functions
+    virials_sae=SingleLossFunction('virials',
+                                   lambda y, y_pred, n_atoms: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).abs().sum(),
+                                   lambda losses, n_structures, n_atoms: losses.sum()),
+    virials_mae=SingleLossFunction('virials',
+                                   lambda y, y_pred, n_atoms: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).abs().sum(),
+                                   lambda losses, n_structures, n_atoms: losses.sum() / (6*n_structures)),
+    virials_sse=SingleLossFunction('virials',
+                                   lambda y, y_pred, n_atoms: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).square().sum(),
+                                   lambda losses, n_structures, n_atoms: losses.sum()),
+    virials_mse=SingleLossFunction('virials',
+                                  lambda y, y_pred, n_atoms: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).square().sum(),
+                                  lambda losses, n_structures, n_atoms: losses.sum() / (6*n_structures)),
+    virials_rmse=SingleLossFunction('virials',
+                                   lambda y, y_pred, n_atoms: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).square().sum(),
+                                   lambda losses, n_structures, n_atoms: (losses.sum() / (6*n_structures)).sqrt()),
+    virials_l4=SingleLossFunction('virials',
+                                 lambda y, y_pred, n_atoms: ((full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)) ** 4).sum(),
+                                 lambda losses, n_structures, n_atoms: (losses.sum() / (6 * n_structures)) ** 0.25),
+    virials_maxe=SingleLossFunction('virials',
+                                   lambda y, y_pred, n_atoms: (full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).abs().max(),
+                                   lambda losses, n_structures, n_atoms: losses.max()),
     virials_by_sqrt_atoms_sse=SingleLossFunction('virials',
-                                                 lambda y, y_pred, batch: ((full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).square() / batch.n_atoms[:, None]).sum(),
+                                                 lambda y, y_pred, n_atoms: ((full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)).square() / n_atoms[:, None]).sum(),
                                                  lambda losses, n_structures, n_atoms: losses.sum()),
     virials_per_atom_mae=SingleLossFunction('virials',
-                                            lambda y, y_pred, batch: ((full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)) / batch.n_atoms[:, None]).abs().sum(),
+                                            lambda y, y_pred, n_atoms: ((full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)) / n_atoms[:, None]).abs().sum(),
                                             lambda losses, n_structures, n_atoms: losses.sum() / (6 * n_structures)),
     virials_per_atom_rmse=SingleLossFunction('virials',
-                                             lambda y, y_pred, batch: ((full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)) / batch.n_atoms[:, None]).square().sum(),
+                                             lambda y, y_pred, n_atoms: ((full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred)) / n_atoms[:, None]).square().sum(),
                                              lambda losses, n_structures, n_atoms: (losses.sum() / (6 * n_structures)).sqrt()),
     virials_per_atom_mse=SingleLossFunction('virials',
-                                            lambda y, y_pred, batch: ((full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred))/batch.n_atoms[:, None]).square().sum(),
-                                            lambda losses, n_structures, n_atoms: losses.sum() / (6 * n_structures))
+                                            lambda y, y_pred, n_atoms: ((full_3x3_to_voigt_6_stress(y)-full_3x3_to_voigt_6_stress(y_pred))/n_atoms[:, None]).square().sum(),
+                                            lambda losses, n_structures, n_atoms: losses.sum() / (6 * n_structures)),
+    # partial charges loss functions
+    partial_charges_sae=SingleLossFunction('partial_charges',
+                                           lambda y, y_pred, n_atoms: (y-y_pred).abs().sum(),
+                                           lambda losses, n_structures, n_atoms: losses.sum()),
+    partial_charges_mae=SingleLossFunction('partial_charges',
+                                           lambda y, y_pred, n_atoms: (y-y_pred).abs().sum(),
+                                           lambda losses, n_structures, n_atoms: losses.sum() / n_atoms),
+    partial_charges_sse=SingleLossFunction('partial_charges',
+                                           lambda y, y_pred, n_atoms: (y-y_pred).square().sum(),
+                                           lambda losses, n_structures, n_atoms: losses.sum()),
+    partial_charges_mse=SingleLossFunction('partial_charges',
+                                           lambda y, y_pred, n_atoms: (y-y_pred).square().sum(),
+                                           lambda losses, n_structures, n_atoms: losses.sum() / n_atoms),
+    partial_charges_rmse=SingleLossFunction('partial_charges',
+                                            lambda y, y_pred, n_atoms: (y-y_pred).square().sum(),
+                                            lambda losses, n_structures, n_atoms: (losses.sum() / n_atoms).sqrt()),
+    # dipole moment loss function
+    dipole_moment_sae=SingleLossFunction('dipole_moment',
+                                           lambda y, y_pred, n_atoms: (y-y_pred).abs().sum(),
+                                           lambda losses, n_structures, n_atoms: losses.sum()),
+    dipole_moment_mae=SingleLossFunction('dipole_moment',
+                                           lambda y, y_pred, n_atoms: (y-y_pred).abs().sum(),
+                                           lambda losses, n_structures, n_atoms: losses.sum() / (3 * n_structures)),
+    dipole_moment_sse=SingleLossFunction('dipole_moment',
+                                           lambda y, y_pred, n_atoms: (y-y_pred).square().sum(),
+                                           lambda losses, n_structures, n_atoms: losses.sum()),
+    dipole_moment_mse=SingleLossFunction('dipole_moment',
+                                           lambda y, y_pred, n_atoms: (y-y_pred).square().sum(),
+                                           lambda losses, n_structures, n_atoms: losses.sum() / (3 * n_structures)),
+    dipole_moment_rmse=SingleLossFunction('dipole_moment',
+                                            lambda y, y_pred, n_atoms: (y-y_pred).square().sum(),
+                                            lambda losses, n_structures, n_atoms: (losses.sum() / (3 * n_structures)).sqrt()),
+    dipole_moment_by_sqrt_atoms_sse=SingleLossFunction('dipole_moment',
+                                                       lambda y, y_pred, n_atoms: ((y-y_pred).square() / n_atoms[:, None]).sum(),
+                                                       lambda losses, n_structures, n_atoms: losses.sum()),
+    dipole_moment_per_atom_mae=SingleLossFunction('dipole_moment',
+                                                  lambda y, y_pred, n_atoms: ((y-y_pred) / n_atoms[:, None]).abs().sum(),
+                                                  lambda losses, n_structures, n_atoms: losses.sum() / (3 * n_structures)),
+    dipole_moment_atom_mse=SingleLossFunction('dipole_moment',
+                                              lambda y, y_pred, n_atoms: ((y-y_pred) / n_atoms[:, None]).square().sum(),
+                                              lambda losses, n_structures, n_atoms: losses.sum() / (3 * n_structures)),
+    dipole_moment_per_atom_rmse=SingleLossFunction('dipole_moment',
+                                                   lambda y, y_pred, n_atoms: ((y-y_pred) / n_atoms[:, None]).square().sum(),
+                                                   lambda losses, n_structures, n_atoms: (losses.sum() / (3 * n_structures)).sqrt()),
+    dipole_moment_cosine_sim_sum=SingleLossFunction('dipole_moment',
+                                                    lambda y, y_pred, n_atoms: (1.0 - normalized_dot_product(y, y_pred)).sum(),
+                                                    lambda losses, n_structures, n_atoms: losses.sum()),
+    dipole_moment_cosine_sim_mean=SingleLossFunction('dipole_moment',
+                                                     lambda y, y_pred, n_atoms: (1.0 - normalized_dot_product(y, y_pred)).sum(),
+                                                     lambda losses, n_structures, n_atoms: losses.sum() / n_structures),
+    # quadrupole moment loss functions
+    quadrupole_moment_sae=SingleLossFunction('quadrupole_moment',
+                                             lambda y, y_pred, n_atoms: (full_3x3_to_5_quadrupole(y)-full_3x3_to_5_quadrupole(y_pred)).abs().sum(),
+                                             lambda losses, n_structures, n_atoms: losses.sum()),
+    quadrupole_moment_mae=SingleLossFunction('quadrupole_moment',
+                                             lambda y, y_pred, n_atoms: (full_3x3_to_5_quadrupole(y)-full_3x3_to_5_quadrupole(y_pred)).abs().sum(),
+                                             lambda losses, n_structures, n_atoms: losses.sum() / (5 * n_structures)),
+    quadrupole_moment_sse=SingleLossFunction('quadrupole_moment',
+                                             lambda y, y_pred, n_atoms: (full_3x3_to_5_quadrupole(y)-full_3x3_to_5_quadrupole(y_pred)).square().sum(),
+                                             lambda losses, n_structures, n_atoms: losses.sum()),
+    quadrupole_moment_mse=SingleLossFunction('quadrupole_moment',
+                                             lambda y, y_pred, n_atoms: (full_3x3_to_5_quadrupole(y)-full_3x3_to_5_quadrupole(y_pred)).square().sum(),
+                                             lambda losses, n_structures, n_atoms: losses.sum() / (5 * n_structures)),
+    quadrupole_moment_rmse=SingleLossFunction('quadrupole_moment',
+                                              lambda y, y_pred, n_atoms: (full_3x3_to_5_quadrupole(y)-full_3x3_to_5_quadrupole(y_pred)).square().sum(),
+                                              lambda losses, n_structures, n_atoms: (losses.sum() / (5 * n_structures)).sqrt()),
+    quadrupole_moment_by_sqrt_atoms_sse=SingleLossFunction('quadrupole_moment',
+                                                           lambda y, y_pred, n_atoms: ((full_3x3_to_5_quadrupole(y)-full_3x3_to_5_quadrupole(y_pred)).square() / n_atoms[:, None]).sum(),
+                                                           lambda losses, n_structures, n_atoms: losses.sum()),
+    quadrupole_moment_per_atom_mae=SingleLossFunction('quadrupole_moment',
+                                                      lambda y, y_pred, n_atoms: ((full_3x3_to_5_quadrupole(y)-full_3x3_to_5_quadrupole(y_pred)) / n_atoms[:, None]).abs().sum(),
+                                                      lambda losses, n_structures, n_atoms: losses.sum() / (5 * n_structures)),
+    quadrupole_moment_atom_mse=SingleLossFunction('quadrupole_moment',
+                                                  lambda y, y_pred, n_atoms: ((full_3x3_to_5_quadrupole(y)-full_3x3_to_5_quadrupole(y_pred)) / n_atoms[:, None]).square().sum(),
+                                                  lambda losses, n_structures, n_atoms: losses.sum() / (5 * n_structures)),
+    quadrupole_moment_per_atom_rmse=SingleLossFunction('quadrupole_moment',
+                                                       lambda y, y_pred, n_atoms: ((full_3x3_to_5_quadrupole(y)-full_3x3_to_5_quadrupole(y_pred)) / n_atoms[:, None]).square().sum(),
+                                                       lambda losses, n_structures, n_atoms: (losses.sum() / (5 * n_structures)).sqrt()),
+
 )
 
 def config_to_loss(config: dict) -> LossFunction:

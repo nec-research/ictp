@@ -11,7 +11,7 @@
             Nicolas Weber (nicolas.weber@neclab.eu)
             Mathias Niepert (mathias.niepert@ki.uni-stuttgart.de)
 
-NEC Laboratories Europe GmbH, Copyright (c) 2024, All rights reserved.  
+NEC Laboratories Europe GmbH, Copyright (c) 2025, All rights reserved.  
 
        THIS HEADER MAY NOT BE EXTRACTED OR MODIFIED IN ANY WAY.
  
@@ -166,8 +166,10 @@ from torch_ema import ExponentialMovingAverage
 from ictp.data.data import AtomicData
 
 from ictp.model.forward import ForwardAtomisticNetwork
+from ictp.model.pair_potentials import ZBLRepulsionEnergy, D4DispersionEnergy
 from ictp.model.calculators import StructurePropertyCalculator
 
+from ictp.training.sam import SAM
 from ictp.training.callbacks import TrainingCallback
 from ictp.training.loss_fns import LossFunction, TotalLossTracker
 
@@ -217,13 +219,16 @@ def eval_metrics(calc: StructurePropertyCalculator,
                        forces='forces' in eval_output_variables,
                        stress='stress' in eval_output_variables,
                        virials='virials' in eval_output_variables,
-                       create_graph=True)
+                       dipole_moment='dipole_moment' in eval_output_variables,
+                       quadrupole_moment='quadrupole_moment' in eval_output_variables,
+                       create_graph=False)
 
-        if early_stopping_loss_fn is not None:
-            early_stopping_loss_tracker.append_batch(results, batch)
+        with torch.no_grad():
+            if early_stopping_loss_fn is not None:
+                early_stopping_loss_tracker.append_batch(results, batch)
 
-        for loss_tracker in loss_trackers.values():
-            loss_tracker.append_batch(results, batch)
+            for loss_tracker in loss_trackers.values():
+                loss_tracker.append_batch(results, batch)
 
     metrics['eval_losses'] = {name: loss_tracker.compute_final_result(n_structures_total, n_atoms_total).item() for name, loss_tracker in loss_trackers.items()}
 
@@ -253,6 +258,7 @@ class Trainer:
                                         best models, if requested.  Defaults to 1.
         train_batch_size (int, optional): Training mini-batch size. Defaults to 32.
         valid_batch_size (int, optional): Validation mini-batch size. Defaults to 100.
+        n_workers (int, optional): Number of workers for data loading. Defaults to 0.
         callbacks (Optional[List[TrainingCallback]], optional): Callbacks to track training process. 
                                                                 Defaults to None.
         opt_class (optional): Optimizer class. Defaults to torch.optim.Adam.
@@ -261,32 +267,52 @@ class Trainer:
         weight_decay (float, optional): Weight decay for the parameters of product basis.
         ema (bool, optional): It True, use exponential moving average.
         ema_decay (float, optional): Decay parameter for the exponential moving average.
+        with_sam (bool, optional): If True, SAM is used for adversarial training. Defaults to False.
+        rho_sam (float, optional): Radius for perturbing the parameter space within SAM. Defaults to 0.05.
+        adaptive_sam (bool, optional): If True, adaptive SAM is used (e.g., for the Adam optimizer). 
+                                       Defaults to False.
+        with_torch_script (bool, optional): If True, the model is compiled using torch.jit.script().
+                                            Defaults to False.
+        with_torch_compile (bool, optional): If True, the model is compiled using torch.compile().
+                                             Defaults to False.
     """
-    def __init__(self,
-                 model: ForwardAtomisticNetwork,
-                 lr: float,
-                 lr_factor: float,
-                 scheduler_patience: int,
-                 model_path: str,
-                 train_loss: LossFunction,
-                 eval_losses: Dict[str, LossFunction],
-                 early_stopping_loss: LossFunction,
-                 device: Optional[str] = None,
-                 max_epoch: int = 1000,
-                 save_epoch: int = 100,
-                 validate_epoch: int = 1,
-                 train_batch_size: int = 32,
-                 valid_batch_size: int = 100,
-                 callbacks: Optional[List[TrainingCallback]] = None,
-                 opt_class=torch.optim.Adam,
-                 amsgrad: bool = False,
-                 max_grad_norm: Optional[float] = None,
-                 weight_decay: float = 5e-7,
-                 ema: bool = False,
-                 ema_decay: float = 0.99):
+    def __init__(
+        self,
+        model: ForwardAtomisticNetwork,
+        lr: float,
+        lr_factor: float,
+        scheduler_patience: int,
+        model_path: str,
+        train_loss: LossFunction,
+        eval_losses: Dict[str, LossFunction],
+        early_stopping_loss: LossFunction,
+        device: Optional[str] = None,
+        max_epoch: int = 1000,
+        save_epoch: int = 100,
+        validate_epoch: int = 1,
+        train_batch_size: int = 32,
+        valid_batch_size: int = 100,
+        n_workers: int = 0,
+        callbacks: Optional[List[TrainingCallback]] = None,
+        opt_class=torch.optim.Adam,
+        amsgrad: bool = False,
+        max_grad_norm: Optional[float] = None,
+        weight_decay: float = 5e-7,
+        ema: bool = False,
+        ema_decay: float = 0.99,
+        with_sam: bool = False,
+        rho_sam: float = 0.05,
+        adaptive_sam: bool = False,
+        with_torch_script: bool = False,
+        with_torch_compile: bool = False,
+    ):
         self.model = model
         self.device = device or get_default_device()
-        self.calc = StructurePropertyCalculator(self.model, training=True).to(self.device)
+        self.calc = StructurePropertyCalculator(
+            model=self.model,
+            with_torch_script=with_torch_script,
+            with_torch_compile=with_torch_compile,
+        ).to(self.device)
         self.train_loss = train_loss
         self.eval_loss_fns = eval_losses
         self.early_stopping_loss_fn = early_stopping_loss
@@ -302,39 +328,80 @@ class Trainer:
             else:
                 no_decay_interactions[name] = param
         
-        parameter_ops = dict(
-            params=[
-                {
-                    'name': 'embedding', 
-                    'params': self.model.representation.node_embedding.parameters(), 
+        params = [
+            {
+                'name': 'embedding',
+                'params': self.model.representation.node_embedding.parameters(), 
+                'weight_decay': 0.0,
+            },
+            {
+                'name': 'interactions_decay',
+                'params': list(decay_interactions.values()),
+                'weight_decay': weight_decay,
+            },
+            {
+                'name': 'interactions_no_decay',
+                'params': list(no_decay_interactions.values()),
+                'weight_decay': 0.0,
+            },
+            {
+                'name': 'products',
+                'params': self.model.representation.products.parameters(),
+                'weight_decay': weight_decay,
+            },
+            {
+                'name': 'readouts',
+                'params': self.model.readouts.parameters(),
+                'weight_decay': 0.0,
+            },]
+        
+        for pair_potential in self.model.pair_potentials:
+            if isinstance(pair_potential, ZBLRepulsionEnergy):
+                params.append({
+                    'name': 'zbl_repulsion',
+                    'params': pair_potential.parameters(),
                     'weight_decay': 0.0,
-                },
-                {
-                    'name': 'interactions_decay',
-                    'params': list(decay_interactions.values()),
-                    'weight_decay': weight_decay,
-                },
-                {
-                    'name': 'interactions_no_decay',
-                    'params': list(no_decay_interactions.values()),
+                })
+            elif isinstance(pair_potential, D4DispersionEnergy):
+                params.append({
+                    'name': 'd4_dispersion',
+                    'params': pair_potential.parameters(),
                     'weight_decay': 0.0,
-                },
-                {
-                    'name': 'products',
-                    'params': self.model.representation.products.parameters(),
-                    'weight_decay': weight_decay,
-                },
-                {
-                    'name': 'readouts',
-                    'params': self.model.readouts.parameters(),
-                    'weight_decay': 0.0,
-                }],
-            lr=lr,
-            amsgrad=amsgrad
+                })
+        
+        # add charge_embedding parameters if required
+        if self.model.config.get('use_charge_embedding', False):
+            params.append({
+                'name': 'charge_embedding',
+                'params': self.model.representation.charge_embedding.parameters(),
+                'weight_decay': 0.0,
+            })
+               
+        # parameter_ops = dict(params=params, lr=lr, amsgrad=amsgrad)
+        # self.optimizer = opt_class(**parameter_ops)
+        
+        self.with_sam = with_sam
+        if self.with_sam:
+            self.optimizer = SAM(
+                params=params,
+                base_optimizer=opt_class,
+                rho=rho_sam,
+                adaptive=adaptive_sam,
+                lr=lr,
+                amsgrad=amsgrad
+            )
+        else:
+            self.optimizer = opt_class(
+                params=params,
+                lr=lr,
+                amsgrad=amsgrad
             )
         
-        self.optimizer = opt_class(**parameter_ops)
-        self.lr_sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=self.optimizer, factor=lr_factor, patience=scheduler_patience)
+        self.lr_sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer=self.optimizer,
+            factor=lr_factor,
+            patience=scheduler_patience
+        )
         
         if ema:
             self.ema = ExponentialMovingAverage(self.model.parameters(), decay=ema_decay)
@@ -348,6 +415,7 @@ class Trainer:
         self.validate_epoch = validate_epoch
         self.train_batch_size = train_batch_size
         self.valid_batch_size = valid_batch_size
+        self.n_workers = n_workers
         self.max_grad_norm = max_grad_norm
 
         self.epoch = 0
@@ -448,6 +516,8 @@ class Trainer:
                             forces='forces' in self.train_output_variables,
                             stress='stress' in self.train_output_variables,
                             virials='virials' in self.train_output_variables,
+                            dipole_moment='dipole_moment' in self.train_output_variables,
+                            quadrupole_moment='quadrupole_moment' in self.train_output_variables,
                             create_graph=True)
 
         # compute sum of train losses for model
@@ -460,7 +530,36 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
         
         # optimizer update
-        self.optimizer.step()
+        if self.with_sam:
+            # perform the first step of the SAM optimizer (compute loss regularization)
+            self.optimizer.first_step(zero_grad=True)
+            
+            # second forward-backward pass
+            results = self.calc(batch, 
+                                forces='forces' in self.train_output_variables,
+                                stress='stress' in self.train_output_variables,
+                                virials='virials' in self.train_output_variables,
+                                dipole_moment='dipole_moment' in self.train_output_variables,
+                                quadrupole_moment='quadrupole_moment' in self.train_output_variables,
+                                create_graph=True)
+            
+            tracker = TotalLossTracker(self.train_loss, requires_grad=True)
+            tracker.append_batch(results, batch)
+            loss = tracker.compute_final_result(n_atoms_total=batch.n_atoms.sum(), n_structures_total=batch.n_atoms.shape[0])
+            loss.backward()
+            
+            if self.max_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
+                
+            # perform the second step of the SAM optimizer (step using the regularized loss)
+            self.optimizer.second_step(zero_grad=True)
+        else:  
+            self.optimizer.step()
+        
+        for pair_potential in self.model.pair_potentials:
+            if isinstance(pair_potential, D4DispersionEnergy):
+                # re-compute refc6 of the D4 dispersion model after performing the training step
+                pair_potential._update_refc6()
         
         if self.ema is not None:
             self.ema.update()
@@ -470,15 +569,16 @@ class Trainer:
                 loss_tracker.append_batch(results, batch)
 
     def fit(self,
-            train_ds: List[AtomicData],
-            valid_ds: List[AtomicData]):
-        """Trains atomistic models using provided training structures. Validation data is used for early stopping.
+            train_dataset: List[AtomicData],
+            valid_dataset: List[AtomicData]):
+        """
+        Trains atomistic models using provided training structures. Validation data is used for early stopping.
 
         Args:
-            train_ds (List[AtomicData]): Training data.
-            valid_ds (List[AtomicData]): Validation data.
+            train_dataset (List[AtomicData]): Training data.
+            valid_dataset (List[AtomicData]): Validation data.
         """
-        # todo: put model in train() mode in the beginning and in eval() mode (or the mode they had before) at the end?
+        # TODO: put model in train() mode in the beginning and in eval() mode (or the mode they had before) at the end?
         # reset in case this fit() is called multiple times and try_load() doesn't find a checkpoint
         self.epoch = 0
         self.best_es_metric = np.Inf
@@ -492,10 +592,24 @@ class Trainer:
 
         # generate data queues for efficient training
         use_gpu = self.device.startswith('cuda')
-        train_dl = DataLoader(train_ds, batch_size=self.train_batch_size, shuffle=True, drop_last=True,
-                              pin_memory=use_gpu, pin_memory_device=self.device if use_gpu else '')
-        valid_dl = DataLoader(valid_ds, batch_size=self.valid_batch_size, shuffle=False, drop_last=False,
-                              pin_memory=use_gpu, pin_memory_device=self.device if use_gpu else '')
+        train_dl = DataLoader(
+            dataset=train_dataset,
+            batch_size=self.train_batch_size,
+            num_workers=self.n_workers,
+            shuffle=True,
+            drop_last=True,
+            pin_memory=use_gpu,
+            pin_memory_device=self.device if use_gpu else ''
+        )
+        valid_dl = DataLoader(
+            valid_dataset,
+            batch_size=self.valid_batch_size,
+            num_workers=self.n_workers,
+            shuffle=False,
+            drop_last=False,
+            pin_memory=use_gpu,
+            pin_memory_device=self.device if use_gpu else ''
+        )
 
         for callback in self.callbacks:
             callback.before_fit(self)

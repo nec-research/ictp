@@ -11,7 +11,7 @@
             Nicolas Weber (nicolas.weber@neclab.eu)
             Mathias Niepert (mathias.niepert@ki.uni-stuttgart.de)
 
-NEC Laboratories Europe GmbH, Copyright (c) 2024, All rights reserved.  
+NEC Laboratories Europe GmbH, Copyright (c) 2025, All rights reserved.  
 
        THIS HEADER MAY NOT BE EXTRACTED OR MODIFIED IN ANY WAY.
  
@@ -172,6 +172,7 @@ DEFAULT_CONFIG = dict(
     n_valid=None,
     train_batch_size=32,
     eval_batch_size=100,
+    n_workers=0,
     neighbors='matscipy',
     model_path=None,
     model_seed=random.randint(0, 9999999),
@@ -192,6 +193,30 @@ DEFAULT_CONFIG = dict(
     avg_n_neighbors=1,
     compute_avg_n_neighbors=True,
     compute_regression_shift=True,
+    # Additional energy contributions (pair potentials)
+    partial_charges='corrected',
+    ke=14.399645351950548,              # Coulomb constant (shared across all pair potentials)
+    exclusion_radius=None,
+    n_exclusion_polynomial_cutoff=5,
+    use_charge_embedding=False,
+    repulsion={
+        'method': None,                 # define the method for the repulsive interactions
+        'r_cutoff': None,               # define the cutoff for the repulsive interactions
+        'n_polynomial_cutoff': 3
+        },
+    electrostatics={
+        'method': None,                 # define the method for the electrostatic interactions
+        'r_cutoff': None,               # define the cutoff for the electrostatic interactions
+        'alpha': None,                  # The damping factor for Ewald summation/SPME method
+        'k_max': None,                  # k-space cutoff for Ewald summation/SPME method
+        'spline_order': 5,              # B-spline order for the SPME method
+        },
+    dispersion={
+        'method': None,                 # define the method for the dispersion interactions
+        'r_cutoff': None,               # define the cutoff for the dispersion interactions
+        'Bohr': 0.5291772105638411,     # conversion factor for distances
+        'Hartree': 27.211386024367243,  # conversion factor for energies
+        },
     # Training epochs and optimizer
     max_epoch=1000,
     save_epoch=100,
@@ -204,6 +229,9 @@ DEFAULT_CONFIG = dict(
     weight_decay=5.0e-7,
     ema=True,
     ema_decay=0.99,
+    with_sam=False,
+    rho_sam=0.005,
+    adaptive_sam=True,
     # Training, early stopping, and evaluation losses
     train_loss={
         'type': 'weighted_sum',

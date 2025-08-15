@@ -11,7 +11,7 @@
             Nicolas Weber (nicolas.weber@neclab.eu)
             Mathias Niepert (mathias.niepert@ki.uni-stuttgart.de)
 
-NEC Laboratories Europe GmbH, Copyright (c) 2024, All rights reserved.  
+NEC Laboratories Europe GmbH, Copyright (c) 2025, All rights reserved.  
 
        THIS HEADER MAY NOT BE EXTRACTED OR MODIFIED IN ANY WAY.
  
@@ -154,105 +154,156 @@ from typing import Optional
 
 import numpy as np
 
-from ictp.data.data import AtomicStructures
+import torch
+
+from ictp.utils.torch_geometric import DataLoader
+from ictp.utils.math import segment_sum
 
 
-def get_energy_shift_per_atom(structures: AtomicStructures, 
-                              n_species: int,
-                              atomic_energies: Optional[np.ndarray] = None,
-                              compute_regression_shift: bool = True) -> np.ndarray:
-    """Computes energy shift parameters for each atomic species in the data set. If atomic 
-    energies are provided, they are subtracted from the total energy before computing 
-    the mean and the regression solution.
+def get_energy_shift_per_atom(
+    data_loader: DataLoader,
+    n_species: int,
+    atomic_energies: Optional[np.ndarray] = None,
+    compute_regression_shift: bool = True
+) -> np.ndarray:
+    """
+    Computes energy shift parameters for each atomic species in the data set. 
+    If atomic energies are provided, they are subtracted from the total energy 
+    before computing the mean and the regression solution.
 
     Args:
-        structures (AtomicStructures): Atomic structures in the data set.
-        n_species (int): Total number of atom species (atom types).
-        atomic_energies (np.ndarray, optional): Atomic energies. Defaults to None.
+        data_loader (DataLoader): Provides batches of atomic data.
+        n_species (int): Total number of atomic species (atom types).
+        atomic_energies (np.ndarray, optional): Predefined atomic energies. Defaults to None.
+        compute_regression_shift (bool, optional): If True, computes regression shift. Defaults to True.
 
     Returns:
         np.ndarray: Atomic energy shift parameters.
     """
+    # initialize atomic energies
     if atomic_energies is None:
-        atomic_energies = np.zeros(n_species)
+        atomic_energies = torch.zeros(n_species, dtype=torch.float64)
     else:
-        assert len(atomic_energies) == n_species
-        atomic_energies = np.array(atomic_energies)
+        if len(atomic_energies) != n_species:
+            raise RuntimeError(
+                f'Length of atomic_energies {len(atomic_energies)} must match n_species {n_species}.'
+            )
+        atomic_energies = torch.tensor(atomic_energies, dtype=torch.float64)
     
-    if compute_regression_shift:
-        energy_sum = 0.0
-        atoms_sum = 0
-        for structure in structures:
-            atomic_energies_sum = sum(atomic_energies.take(structure.species))
-            energy_sum += (structure.energy - atomic_energies_sum)
-            atoms_sum += structure.n_atoms
-        energy_per_atom_mean = energy_sum / atoms_sum
+    if not compute_regression_shift:
+        return atomic_energies.cpu().detach().numpy()
+    
+    # initialize energy and atom sums
+    energy_sum = torch.tensor(0.0, dtype=torch.float64)
+    atoms_sum = torch.tensor(0.0, dtype=torch.float64)
+    
+    # compute mean energy per atom
+    for batch in data_loader:
+        energy = batch.energy.to(torch.float64)
+        species = batch.species.to(torch.long)
         
-        # compute regression from (n_per_species_1, ...) to energy - atomic_energies_sum - n_atoms * energy_per_atom_mean
-        # the reason that we subtract energy_per_atom_mean and atomic_energies_sum is that we don't want to regularize 
-        # the mean and atomic energies
-        XTy = np.zeros(n_species)
-        XTX = np.zeros(shape=(n_species, n_species), dtype=np.int64)
-        for structure in structures:
-            Z_counts = np.zeros(n_species, dtype=np.int64)
-            for z in structure.species:
-                Z_counts[int(z)] += 1
-            atomic_energies_sum = sum(atomic_energies.take(structure.species))
-            err = structure.energy - atomic_energies_sum - structure.n_atoms * energy_per_atom_mean
-            XTy += err * Z_counts
-            XTX += Z_counts[None, :] * Z_counts[:, None]
+        # compute sum of atomic energies for the batch
+        atomic_energies_sum = segment_sum(
+            atomic_energies[species], batch.batch, batch.n_atoms.shape[0], 0
+        )
+        
+        energy_sum += (energy - atomic_energies_sum).sum()
+        atoms_sum += batch.n_atoms.sum()
+    
+    energy_per_atom_mean = energy_sum / atoms_sum
+    
+    # prepare for regression
+    XTy = torch.zeros(n_species, dtype=torch.float64)
+    XTX = torch.zeros((n_species, n_species), dtype=torch.long)
+    
+    for batch in data_loader:
+        energy = batch.energy.to(torch.float64)
+        species = batch.species.to(torch.long)
+        
+        # compute species count matrix Z_counts for the batch
+        Z_counts = torch.zeros(batch.n_atoms.shape[0], n_species, dtype=torch.long)
+        for j in range(batch.n_atoms.shape[0]):
+            structure_species = species[batch.ptr[j]:batch.ptr[j + 1]]
+            Z_counts[j] = torch.bincount(structure_species, minlength=n_species)
+        
+        atomic_energies_sum = segment_sum(
+            atomic_energies[species], batch.batch, batch.n_atoms.shape[0], 0
+        )
+        
+        residual = (
+            energy
+            - atomic_energies_sum
+            - batch.n_atoms * energy_per_atom_mean
+        )
+        
+        # update regression matrices
+        XTy += (residual[:, None] * Z_counts).sum(dim=0)
+        XTX += (Z_counts[:, :, None] * Z_counts[:, None, :]).sum(dim=0)
 
-        lam = 1.0  # regularization, should be a float such that the integer matrix XTX is converted to float
-        regression_shift = np.linalg.solve(XTX + lam * np.eye(n_species), XTy)
-        return regression_shift + energy_per_atom_mean + atomic_energies
-    else:
-        return atomic_energies
+    # solve for regression shift
+    lam = 1.0  # regularization parameter
+    regression_shift = torch.linalg.solve(
+        XTX + lam * torch.eye(n_species, dtype=torch.float64), XTy
+    )
+    
+    return (regression_shift + energy_per_atom_mean + atomic_energies).cpu().detach().numpy()
 
 
-def get_forces_rms(structures: AtomicStructures,
-                   n_species: int) -> np.ndarray:
-    """Computes the root mean square of forces across atomic structures in the data set.
+def get_forces_rms(
+    data_loader: DataLoader,
+    n_species: int
+) -> np.ndarray:
+    """
+    Computes the root mean square (RMS) of forces across atomic structures in the data set.
 
     Args:
-        structures (AtomicStructures): Atomic structures in the data set.
-        n_species (int): Total number of atom species.
+        data_loader (DataLoader): Provides batches of atomic data.
+        n_species (int): Total number of atomic species (atom types).
 
     Returns:
-        np.ndarray: Root mean square of forces across atomic structures in the data set.
+        np.ndarray: Root mean square (RMS) of forces across atomic structures in the data set.
     """
     sq_forces_sum = 0.0
     atoms_sum = 0
     
-    for structure in structures:
-        sq_forces_sum += (structure.forces ** 2).sum()
-        atoms_sum += structure.n_atoms
-    forces_rms = np.sqrt(sq_forces_sum / atoms_sum / 3.0) * np.ones(n_species)
+    for batch in data_loader:
+        forces = batch.forces.to(torch.float64)
+        
+        # accumulate the squared forces and atom counts
+        sq_forces_sum += forces.square().sum().item()
+        atoms_sum += batch.n_atoms.sum().item()
     
-    # set zeros to ones
+    forces_rms = np.sqrt(sq_forces_sum / (atoms_sum * 3.0)) * np.ones(n_species)
+    
+    # ensure no zero values in the output
     forces_rms[forces_rms == 0.0] = 1.0
             
     return forces_rms
 
 
-def get_avg_n_neighbors(structures: AtomicStructures,
-                        r_cutoff: float) -> float:
-    """Computes the average number of neighbors in the data set. 
-    
-    Adapted from MACE (https://github.com/ACEsuit/mace/blob/main/mace/modules/utils.py).
+def get_avg_n_neighbors(data_loader: DataLoader) -> float:
+    """
+    Computes the average number of neighbors in the data set.
 
+    Adapted from MACE: https://github.com/ACEsuit/mace/blob/main/mace/modules/utils.py
+    
     Args:
-        structures (AtomicStructures): Atomic structures in the data set.
-        r_cutoff (float): Cutoff radius for computing the neighbor list.
+        data_loader (DataLoader): Provides batches of atomic data.
 
     Returns:
-        float: Average number of neighbors in the data set.
+        float: Average number of neighbors per atom in the data set.
     """
     n_neighbors = []
-
-    for structure in structures:
-        # we set skin=0 because otherwise the average number of neighbors is incorrect
-        idx_i, _ = structure.get_edge_index(r_cutoff, skin=0.0)
-        _, counts = np.unique(idx_i, return_counts=True)
-        n_neighbors.extend(counts)
     
-    return np.mean(n_neighbors)
+    for batch in data_loader:
+        idx_i, _ = batch.edge_index
+        
+        # count occurrences of each index
+        _, counts = torch.unique(idx_i, return_counts=True)
+        n_neighbors.append(counts)
+        
+    avg_n_neighbors = torch.mean(
+        torch.cat(n_neighbors, dim=0).type(torch.get_default_dtype())
+    )
+    
+    return avg_n_neighbors.cpu().detach().numpy().item()
