@@ -8,6 +8,8 @@ Official repository for the [paper](https://arxiv.org/abs/2405.14253) _"Higher R
 
 <img src="ictp_lr.png" alt="ICTP_LR" width="600"/>
 
+**Note:** We additionally now have a [workshop submission](https://openreview.net/forum?id=ssfrYXdQ4x) _"Transferable long-range interactions in machine-learned interatomic potentials"_ which discusses our implementations of short- and long-range pair potentials in greater detail and evaluates them on the synthetic point-charge datasets available at https://doi.org/10.5281/zenodo.17652033.
+
 ## Citing us
 
 Please consider citing us if you find the code and paper useful:
@@ -33,6 +35,17 @@ If you are using the ICTP models with analytic pair potentials:
         primaryClass={physics.chem-ph},
         url={https://arxiv.org/abs/2508.10841}, 
     }
+
+If you find the synthetic point-charge datasets useful:
+
+@inproceedings{
+    zaverkin2025transferable,
+    title={Transferable long-range interactions in machine-learned interatomic potentials},
+    author={Viktor Zaverkin and Matheus Ferraz and Francesco Alesiani and Henrik Christiansen and Makoto Takamoto and Federico Errica and Mathias Niepert},
+    booktitle={EurIPS 2025 Workshop on SIMBIOCHEM},
+    year={2025},
+    url={https://openreview.net/forum?id=ssfrYXdQ4x}
+}
 
 ## Implemented methods
 
@@ -73,3 +86,7 @@ In the `examples/dimos` subfolder, we provide example scripts and input files fo
 - [PLUMED](https://www.plumed.org/doc-v2.9/user-doc/html/_installation.html)
 
 In the `examples` subfolder, we also provide a script `run_training_SPICE.py` for training ICTP models with short- and long-range pair potentials
+
+## How to reproduce the results from the [workshop submission](https://openreview.net/forum?id=ssfrYXdQ4x) _"Transferable long-range interactions in machine-learned interatomic potentials"_
+
+In the `examples/point_charges` subfolder, we provide example scripts for training and evaluating ICTP models with short- and long-range pair potentials on the point-charge datasets. The `datasets/point_charges` subfolder contains the scripts used to generate these datasets.
