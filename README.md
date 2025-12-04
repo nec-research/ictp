@@ -38,14 +38,14 @@ If you are using the ICTP models with analytic pair potentials:
 
 If you find the synthetic point-charge datasets useful:
 
-@inproceedings{
-    zaverkin2025transferable,
-    title={Transferable long-range interactions in machine-learned interatomic potentials},
-    author={Viktor Zaverkin and Matheus Ferraz and Francesco Alesiani and Henrik Christiansen and Makoto Takamoto and Federico Errica and Mathias Niepert},
-    booktitle={EurIPS 2025 Workshop on SIMBIOCHEM},
-    year={2025},
-    url={https://openreview.net/forum?id=ssfrYXdQ4x}
-}
+    @inproceedings{
+        zaverkin2025transferable,
+        title={Transferable long-range interactions in machine-learned interatomic potentials},
+        author={Viktor Zaverkin and Matheus Ferraz and Francesco Alesiani and Henrik Christiansen and Makoto Takamoto and Federico Errica and Mathias Niepert},
+        booktitle={EurIPS 2025 Workshop on SIMBIOCHEM},
+        year={2025},
+        url={https://openreview.net/forum?id=ssfrYXdQ4x}
+    }
 
 ## Implemented methods
 
